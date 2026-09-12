@@ -1,10 +1,12 @@
 import { assert, assertEquals, assertFalse } from "@std/assert";
 import { Schema } from "effect";
 import {
+  ConflictRangeType,
   FoundationDbError,
   isFoundationDbError,
   keyRange,
   KeySelector,
+  MutationType,
   StreamingMode,
 } from "../../mod.ts";
 
@@ -47,6 +49,24 @@ Deno.test("keyRange uses inclusive begin and exclusive end selectors", () => {
     reverse: true,
     mode: StreamingMode.Small,
   });
+});
+
+Deno.test("mutation and conflict range constants match the FoundationDB C API", () => {
+  assertEquals(MutationType, {
+    Add: 2,
+    BitAnd: 6,
+    BitOr: 7,
+    BitXor: 8,
+    AppendIfFits: 9,
+    Max: 12,
+    Min: 13,
+    SetVersionstampedKey: 14,
+    SetVersionstampedValue: 15,
+    ByteMin: 16,
+    ByteMax: 17,
+    CompareAndClear: 20,
+  });
+  assertEquals(ConflictRangeType, { Read: 0, Write: 1 });
 });
 
 Deno.test("FoundationDbError is a schema-backed tagged error", () => {

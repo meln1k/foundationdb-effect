@@ -1,5 +1,10 @@
 import { Console, Effect } from "effect";
-import { FoundationDb, FoundationDbTransaction, Subspace } from "../mod.ts";
+import {
+  FoundationDb,
+  FoundationDbTransaction,
+  MutationType,
+  Subspace,
+} from "../mod.ts";
 import {
   assert,
   littleEndianInt64,
@@ -7,19 +12,30 @@ import {
   runMain,
 } from "./_shared.ts";
 
-// The bridge currently selects one client API version (7.4) when its native
-// layer starts. External-client-directory and per-client multi-version network
-// configuration are not exposed yet, so this ports the database operation from
-// the Rust example without claiming multi-version-client coverage.
+// The bridge selects one client API version (7.4) when its native layer starts.
+// External-client-directory and per-client multi-version network configuration
+// are not exposed, but transactions can exchange explicit read versions.
 const program = Effect.gen(function* () {
   const database = yield* FoundationDb;
   const key = yield* Subspace.all().pack(["examples", "multi_version_incr"]);
 
-  yield* database.withTransaction(
+  const readVersion = yield* database.withTransaction(
     Effect.flatMap(
       FoundationDbTransaction,
-      (transaction) => transaction.atomicAdd(key, littleEndianInt64(1n)),
+      (transaction) => transaction.getReadVersion(),
     ),
+  );
+
+  yield* database.withTransaction(
+    Effect.gen(function* () {
+      const transaction = yield* FoundationDbTransaction;
+      yield* transaction.setReadVersion(readVersion);
+      yield* transaction.atomicOp(
+        key,
+        littleEndianInt64(1n),
+        MutationType.Add,
+      );
+    }),
   );
 
   const stored = yield* database.get(key, { snapshot: true });

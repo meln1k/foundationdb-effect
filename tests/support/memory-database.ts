@@ -1,14 +1,22 @@
-import { Effect, Stream } from "effect";
+import { Deferred, Effect, Semaphore, Stream } from "effect";
 import { FoundationDbTransaction } from "../../src/FoundationDb.ts";
 import type {
+  FoundationDbFuture,
   FoundationDbShape,
   FoundationDbTransactionShape,
 } from "../../src/FoundationDb.ts";
+import { MutationType } from "../../src/model.ts";
 import type { Bytes, KeyValue, RangeOptions } from "../../src/model.ts";
 
 interface StoredValue {
   readonly key: Uint8Array;
   readonly value: Uint8Array;
+}
+
+interface MemoryWatch {
+  readonly key: string;
+  readonly deferred: Deferred.Deferred<void>;
+  cancelled: boolean;
 }
 
 const copy = (value: Bytes): Uint8Array => value.slice();
@@ -31,6 +39,10 @@ const keyId = (key: Bytes): string => {
   }
   return output;
 };
+
+const bytesEqual = (left: Bytes, right: Bytes): boolean =>
+  left.byteLength === right.byteLength &&
+  left.every((value, index) => value === right[index]);
 
 const addLittleEndian = (
   current: Bytes | undefined,
@@ -72,9 +84,12 @@ const selectRange = (
 
 const makeTransaction = (
   store: Map<string, StoredValue>,
+  pendingWatches: Array<MemoryWatch>,
+  removeWatch: (watch: MemoryWatch) => void,
 ): FoundationDbTransactionShape => ({
   attempt: 1,
   maybeCommitted: false,
+  conflictingKeyRanges: [],
   get: (key) =>
     Effect.sync(() => {
       const value = store.get(keyId(key));
@@ -103,14 +118,20 @@ const makeTransaction = (
     Effect.sync(() => {
       store.set(keyId(key), { key: copy(key), value: copy(value) });
     }),
-  atomicAdd: (key, value) =>
-    Effect.sync(() => {
-      const id = keyId(key);
-      store.set(id, {
-        key: copy(key),
-        value: addLittleEndian(store.get(id)?.value, value),
-      });
-    }),
+  atomicOp: (key, value, mutationType) =>
+    mutationType === MutationType.Add
+      ? Effect.sync(() => {
+        const id = keyId(key);
+        store.set(id, {
+          key: copy(key),
+          value: addLittleEndian(store.get(id)?.value, value),
+        });
+      })
+      : Effect.die(
+        new Error(
+          "the in-memory test database only implements MutationType.Add",
+        ),
+      ),
   setWithoutWriteConflict: (key, value) =>
     Effect.sync(() => {
       store.set(keyId(key), { key: copy(key), value: copy(value) });
@@ -136,6 +157,33 @@ const makeTransaction = (
       }
     }),
   addWriteConflictRange: () => Effect.void,
+  addReadConflictRange: () => Effect.void,
+  addConflictRange: () => Effect.void,
+  getReadVersion: () => Effect.succeed(0n),
+  setReadVersion: () => Effect.void,
+  getApproximateSize: () => Effect.succeed(0n),
+  watch: (key) =>
+    Effect.sync(() => {
+      const watch: MemoryWatch = {
+        key: keyId(key),
+        deferred: Deferred.makeUnsafe(),
+        cancelled: false,
+      };
+      pendingWatches.push(watch);
+      return {
+        await: Deferred.await(watch.deferred),
+        cancel: Effect.sync(() => {
+          watch.cancelled = true;
+          removeWatch(watch);
+          Deferred.doneUnsafe(watch.deferred, Effect.interrupt);
+        }),
+      } satisfies FoundationDbFuture<void>;
+    }),
+  getVersionstamp: () =>
+    Effect.succeed<FoundationDbFuture<Uint8Array>>({
+      await: Effect.succeed(new Uint8Array(10)),
+      cancel: Effect.void,
+    }),
   getRange: (options) =>
     Stream.suspend(() => Stream.fromIterable(selectRange(store, options))),
 });
@@ -143,11 +191,25 @@ const makeTransaction = (
 export const makeMemoryFoundationDb = (): {
   readonly database: FoundationDbShape;
   readonly entries: () => ReadonlyArray<StoredValue>;
+  readonly activeWatches: () => number;
 } => {
   let store = new Map<string, StoredValue>();
+  let committedVersion = 0n;
+  const watches = new Map<string, Set<MemoryWatch>>();
+  const transactionMutex = Semaphore.makeUnsafe(1);
+  const removeWatch = (watch: MemoryWatch): void => {
+    const registered = watches.get(watch.key);
+    registered?.delete(watch);
+    if (registered?.size === 0) {
+      watches.delete(watch.key);
+    }
+  };
 
-  const withTransaction: FoundationDbShape["withTransaction"] = (effect) =>
-    Effect.suspend(() => {
+  const withTransactionResult: FoundationDbShape["withTransactionResult"] = (
+    effect,
+  ) =>
+    transactionMutex.withPermits(1)(Effect.suspend(() => {
+      const pendingWatches: Array<MemoryWatch> = [];
       const working = new Map(
         Array.from(store, ([id, entry]) => [id, {
           key: copy(entry.key),
@@ -157,17 +219,58 @@ export const makeMemoryFoundationDb = (): {
       return Effect.scoped(Effect.provideService(
         effect,
         FoundationDbTransaction,
-        makeTransaction(working),
+        makeTransaction(working, pendingWatches, removeWatch),
       )).pipe(
         Effect.tap(() =>
           Effect.sync(() => {
+            const changedKeys = new Set([...store.keys(), ...working.keys()]);
+            for (const key of changedKeys) {
+              const previous = store.get(key);
+              const next = working.get(key);
+              if (
+                previous !== undefined && next !== undefined &&
+                bytesEqual(previous.value, next.value)
+              ) {
+                changedKeys.delete(key);
+              }
+            }
             store = working;
+            committedVersion += 1n;
+            for (const key of changedKeys) {
+              const registered = watches.get(key);
+              watches.delete(key);
+              if (registered !== undefined) {
+                for (const watch of registered) {
+                  Deferred.doneUnsafe(watch.deferred, Effect.void);
+                }
+              }
+            }
+            for (const watch of pendingWatches) {
+              if (!watch.cancelled) {
+                let registered = watches.get(watch.key);
+                if (registered === undefined) {
+                  registered = new Set();
+                  watches.set(watch.key, registered);
+                }
+                registered.add(watch);
+              }
+            }
           })
         ),
+        Effect.map((value) => ({ value, committedVersion })),
       );
-    });
+    }));
+
+  const withTransaction: FoundationDbShape["withTransaction"] = (
+    effect,
+    options,
+  ) =>
+    withTransactionResult(effect, options).pipe(
+      Effect.map((result) => result.value),
+    );
 
   const database: FoundationDbShape = {
+    withTransactionResult,
     withTransaction,
     get: (key, options) =>
       withTransaction(
@@ -205,10 +308,29 @@ export const makeMemoryFoundationDb = (): {
           Stream.runCollect(transaction.getRange(options))),
         transactionOptions,
       ),
+    watch: (key, options) =>
+      withTransaction(
+        Effect.flatMap(FoundationDbTransaction, (transaction) =>
+          transaction.watch(key)),
+        options,
+      ).pipe(
+        Effect.flatMap((future) =>
+          future.await.pipe(
+            Effect.onInterrupt(() =>
+              future.cancel
+            ),
+          )
+        ),
+      ),
   };
 
   return {
     database,
     entries: () => entries(store),
+    activeWatches: () =>
+      Array.from(watches.values()).reduce(
+        (count, registered) => count + registered.size,
+        0,
+      ),
   };
 };

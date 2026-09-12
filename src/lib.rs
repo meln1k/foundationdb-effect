@@ -5,7 +5,8 @@ use async_executor::Executor;
 use foundationdb::api::NetworkAutoStop;
 use foundationdb::options::{ConflictRangeType, MutationType, StreamingMode, TransactionOption};
 use foundationdb::{
-    Database, FdbError, KeySelector, RangeOption, Transaction, TransactionCommitError,
+    ConflictingKeyRange, Database, FdbError, KeySelector, RangeOption, Transaction,
+    TransactionCommitError,
 };
 use futures_lite::future::{self, FutureExt};
 use parking_lot::{Condvar, Mutex};
@@ -89,7 +90,10 @@ struct Runtime {
 
 enum TransactionState {
     Active(Transaction),
-    CommitFailed(TransactionCommitError),
+    CommitFailed {
+        error: TransactionCommitError,
+        conflicting_key_ranges: Vec<ConflictingKeyRange>,
+    },
 }
 
 struct RangeCursor {
@@ -134,6 +138,10 @@ impl FfiResult {
 
     fn error(code: i32) -> Self {
         Self { code, ..Self::ok() }
+    }
+
+    fn i64(value: i64) -> Self {
+        Self::bytes(value.to_le_bytes().to_vec(), 0)
     }
 }
 
@@ -422,7 +430,7 @@ fn decode_keys(bytes: &[u8]) -> Result<Vec<&[u8]>, i32> {
 fn active_transaction(state: &Option<TransactionState>) -> Result<&Transaction, i32> {
     match state {
         Some(TransactionState::Active(transaction)) => Ok(transaction),
-        Some(TransactionState::CommitFailed(_)) | None => Err(INVALID_TRANSACTION_STATE),
+        Some(TransactionState::CommitFailed { .. }) | None => Err(INVALID_TRANSACTION_STATE),
     }
 }
 
@@ -452,6 +460,23 @@ fn encode_key_values(values: &foundationdb::future::FdbValues) -> Result<Vec<u8>
         output.extend_from_slice(&data_length.to_le_bytes());
         output.extend_from_slice(key);
         output.extend_from_slice(data);
+    }
+    Ok(output)
+}
+
+fn encode_conflicting_key_ranges(values: &[ConflictingKeyRange]) -> Result<Vec<u8>, i32> {
+    let count = u32::try_from(values.len()).map_err(|_| INVALID_ARGUMENT)?;
+    let mut output = Vec::new();
+    output.extend_from_slice(&count.to_le_bytes());
+    for value in values {
+        let begin = value.begin();
+        let end = value.end();
+        let begin_length = u32::try_from(begin.len()).map_err(|_| INVALID_ARGUMENT)?;
+        let end_length = u32::try_from(end.len()).map_err(|_| INVALID_ARGUMENT)?;
+        output.extend_from_slice(&begin_length.to_le_bytes());
+        output.extend_from_slice(&end_length.to_le_bytes());
+        output.extend_from_slice(begin);
+        output.extend_from_slice(end);
     }
     Ok(output)
 }
@@ -619,6 +644,7 @@ pub extern "C" fn fdb_rs_transaction_set_option(handle: u64, option: u8, value: 
             0 => TransactionOption::Timeout(value),
             1 => TransactionOption::RetryLimit(value),
             2 => TransactionOption::MaxRetryDelay(value),
+            3 => TransactionOption::ReportConflictingKeys,
             _ => return Err(INVALID_ARGUMENT),
         };
         fdb_code(transaction.set_option(option))
@@ -773,12 +799,13 @@ pub unsafe extern "C" fn fdb_rs_transaction_set(
 #[unsafe(no_mangle)]
 /// # Safety
 /// Both pointers must reference the corresponding number of readable bytes.
-pub unsafe extern "C" fn fdb_rs_transaction_atomic_add(
+pub unsafe extern "C" fn fdb_rs_transaction_atomic_op(
     handle: u64,
     key_pointer: *const u8,
     key_length: usize,
     value_pointer: *const u8,
     value_length: usize,
+    mutation_type: i32,
 ) -> i32 {
     code(|| {
         let key = unsafe { input_bytes(key_pointer, key_length) }?;
@@ -786,7 +813,22 @@ pub unsafe extern "C" fn fdb_rs_transaction_atomic_add(
         let runtime = runtime()?;
         let transaction = runtime.transaction(handle)?;
         let state = transaction.lock();
-        active_transaction(&state)?.atomic_op(key, value, MutationType::Add);
+        let mutation_type = match mutation_type {
+            2 => MutationType::Add,
+            6 => MutationType::BitAnd,
+            7 => MutationType::BitOr,
+            8 => MutationType::BitXor,
+            9 => MutationType::AppendIfFits,
+            12 => MutationType::Max,
+            13 => MutationType::Min,
+            14 => MutationType::SetVersionstampedKey,
+            15 => MutationType::SetVersionstampedValue,
+            16 => MutationType::ByteMin,
+            17 => MutationType::ByteMax,
+            20 => MutationType::CompareAndClear,
+            _ => return Err(INVALID_ARGUMENT),
+        };
+        active_transaction(&state)?.atomic_op(key, value, mutation_type);
         Ok(())
     })
 }
@@ -879,12 +921,13 @@ pub unsafe extern "C" fn fdb_rs_transaction_clear_range_without_write_conflict(
 #[unsafe(no_mangle)]
 /// # Safety
 /// Both pointers must reference the corresponding number of readable bytes.
-pub unsafe extern "C" fn fdb_rs_transaction_add_write_conflict_range(
+pub unsafe extern "C" fn fdb_rs_transaction_add_conflict_range(
     handle: u64,
     begin_pointer: *const u8,
     begin_length: usize,
     end_pointer: *const u8,
     end_length: usize,
+    conflict_type: u8,
 ) -> i32 {
     code(|| {
         let begin = unsafe { input_bytes(begin_pointer, begin_length) }?;
@@ -892,10 +935,141 @@ pub unsafe extern "C" fn fdb_rs_transaction_add_write_conflict_range(
         let runtime = runtime()?;
         let transaction = runtime.transaction(handle)?;
         let state = transaction.lock();
-        fdb_code(active_transaction(&state)?.add_conflict_range(
-            begin,
-            end,
-            ConflictRangeType::Write,
+        let conflict_type = match conflict_type {
+            0 => ConflictRangeType::Read,
+            1 => ConflictRangeType::Write,
+            _ => return Err(INVALID_ARGUMENT),
+        };
+        fdb_code(active_transaction(&state)?.add_conflict_range(begin, end, conflict_type))
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn fdb_rs_transaction_get_read_version(
+    handle: u64,
+    callback: Option<CompletionCallback>,
+    request_id: u64,
+) -> i32 {
+    code(|| {
+        let runtime = runtime()?;
+        let transaction = runtime.transaction(handle)?;
+        let state = transaction.lock();
+        let future = active_transaction(&state)?.get_read_version();
+        drop(state);
+        start_async(
+            &runtime.executor,
+            &runtime.activity,
+            request_id,
+            callback,
+            Box::pin(async move { Ok(FfiResult::i64(fdb_code(future.await)?)) }),
+        )
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn fdb_rs_transaction_set_read_version(handle: u64, version: i64) -> i32 {
+    code(|| {
+        let runtime = runtime()?;
+        let transaction = runtime.transaction(handle)?;
+        let state = transaction.lock();
+        active_transaction(&state)?.set_read_version(version);
+        Ok(())
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn fdb_rs_transaction_get_approximate_size(
+    handle: u64,
+    callback: Option<CompletionCallback>,
+    request_id: u64,
+) -> i32 {
+    code(|| {
+        let runtime = runtime()?;
+        let transaction = runtime.transaction(handle)?;
+        let state = transaction.lock();
+        let future = active_transaction(&state)?.get_approximate_size();
+        drop(state);
+        start_async(
+            &runtime.executor,
+            &runtime.activity,
+            request_id,
+            callback,
+            Box::pin(async move { Ok(FfiResult::i64(fdb_code(future.await)?)) }),
+        )
+    })
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+/// `key_pointer` must reference `key_length` readable bytes.
+pub unsafe extern "C" fn fdb_rs_transaction_watch(
+    handle: u64,
+    key_pointer: *const u8,
+    key_length: usize,
+    callback: Option<CompletionCallback>,
+    request_id: u64,
+) -> i32 {
+    code(|| {
+        let key = unsafe { input_bytes(key_pointer, key_length) }?;
+        let runtime = runtime()?;
+        let transaction = runtime.transaction(handle)?;
+        let state = transaction.lock();
+        let future = active_transaction(&state)?.watch(key);
+        drop(state);
+        start_async(
+            &runtime.executor,
+            &runtime.activity,
+            request_id,
+            callback,
+            Box::pin(async move {
+                fdb_code(future.await)?;
+                Ok(FfiResult::ok())
+            }),
+        )
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn fdb_rs_transaction_get_versionstamp(
+    handle: u64,
+    callback: Option<CompletionCallback>,
+    request_id: u64,
+) -> i32 {
+    code(|| {
+        let runtime = runtime()?;
+        let transaction = runtime.transaction(handle)?;
+        let state = transaction.lock();
+        let future = active_transaction(&state)?.get_versionstamp();
+        drop(state);
+        start_async(
+            &runtime.executor,
+            &runtime.activity,
+            request_id,
+            callback,
+            Box::pin(async move {
+                let value = fdb_code(future.await)?;
+                Ok(FfiResult::bytes(value.to_vec(), RESULT_PRESENT))
+            }),
+        )
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn fdb_rs_transaction_get_conflicting_key_ranges(handle: u64) -> *mut FfiResult {
+    result(|| {
+        let runtime = runtime()?;
+        let transaction = runtime.transaction(handle)?;
+        let state = transaction.lock();
+        let Some(TransactionState::CommitFailed {
+            conflicting_key_ranges,
+            ..
+        }) = &*state
+        else {
+            return Err(INVALID_TRANSACTION_STATE);
+        };
+        Ok(FfiResult::bytes(
+            encode_conflicting_key_ranges(conflicting_key_ranges)?,
+            0,
         ))
     })
 }
@@ -1028,10 +1202,15 @@ pub extern "C" fn fdb_rs_transaction_commit(
             callback,
             Box::pin(async move {
                 match future.await {
-                    Ok(_) => Ok(FfiResult::ok()),
+                    Ok(committed) => Ok(FfiResult::i64(fdb_code(committed.committed_version())?)),
                     Err(error) => {
                         let error_code = error.code();
-                        *task_state.lock() = Some(TransactionState::CommitFailed(error));
+                        let conflicting_key_ranges =
+                            error.conflicting_keys().await.unwrap_or_default();
+                        *task_state.lock() = Some(TransactionState::CommitFailed {
+                            error,
+                            conflicting_key_ranges,
+                        });
                         Err(error_code)
                     }
                 }
@@ -1066,7 +1245,7 @@ pub extern "C" fn fdb_rs_transaction_on_error(
                     TransactionState::Active(transaction) => {
                         transaction.on_error(FdbError::from_code(error_code)).await
                     }
-                    TransactionState::CommitFailed(error) => error.on_error().await,
+                    TransactionState::CommitFailed { error, .. } => error.on_error().await,
                 };
                 match result {
                     Ok(transaction) => {

@@ -12,7 +12,13 @@ import {
 import { DirectoryLayer, DirectorySubspace } from "../directory/mod.ts";
 import type { DirectoryOutput } from "../directory/mod.ts";
 import { FoundationDb, FoundationDbTransaction } from "../FoundationDb.ts";
-import { keyRange } from "../model.ts";
+import type { FoundationDbFuture } from "../FoundationDb.ts";
+import {
+  clearChunkedValue,
+  readChunkedValue,
+  writeChunkedValue,
+} from "../internal/chunked-value.ts";
+import { keyRange, MutationType } from "../model.ts";
 import type { Bytes, KeyValue, TransactionOptions } from "../model.ts";
 import { pack, Subspace, unpack } from "../tuple/mod.ts";
 import type { TupleError } from "../tuple/mod.ts";
@@ -25,23 +31,36 @@ const storeLayer = encoder.encode("effect-foundationdb/persisted-queue");
 const queueLayer = encoder.encode("effect-foundationdb/persisted-queue/queue");
 const indexBatchSize = 100;
 const deadLetterTag = "~effect/persistence/PersistedQueue/DeadLetter";
+const signalIncrement = new Uint8Array([1, 0, 0, 0, 0, 0, 0, 0]);
 
-const QueueEntrySchema = Schema.Struct({
+const QueueEntryMetadataFields = {
   id: Schema.String,
-  element: Schema.Json,
   attempts: Schema.Int,
   state: Schema.Literals(["pending", "processing", "completed", "failed"]),
   visibleAt: Schema.Number,
   acquiredAt: Schema.NullOr(Schema.Number),
   acquiredBy: Schema.NullOr(Schema.String),
   updatedAt: Schema.Number,
+} as const;
+const QueueEntrySchema = Schema.Struct({
+  ...QueueEntryMetadataFields,
+  element: Schema.Json,
 });
-const QueueEntryJson = Schema.fromJsonString(QueueEntrySchema);
-const decodeQueueEntry = Schema.decodeUnknownEffect(QueueEntryJson);
-const encodeQueueEntry = Schema.encodeUnknownEffect(QueueEntryJson);
+const QueueEntryMetadataSchema = Schema.Struct(QueueEntryMetadataFields);
+const QueueEntryMetadataJson = Schema.fromJsonString(QueueEntryMetadataSchema);
+const QueueElementJson = Schema.fromJsonString(Schema.Json);
+const decodeQueueEntryMetadata = Schema.decodeUnknownEffect(
+  QueueEntryMetadataJson,
+);
+const encodeQueueEntryMetadata = Schema.encodeUnknownEffect(
+  QueueEntryMetadataJson,
+);
+const decodeQueueElement = Schema.decodeUnknownEffect(QueueElementJson);
+const encodeQueueElement = Schema.encodeUnknownEffect(QueueElementJson);
 const decodeJson = Schema.decodeUnknownEffect(Schema.Json);
 
 type QueueEntry = typeof QueueEntrySchema.Type;
+type QueueEntryMetadata = typeof QueueEntryMetadataSchema.Type;
 type QueueState = QueueEntry["state"];
 
 class QueueStoreFailure extends Schema.TaggedError<QueueStoreFailure>()(
@@ -51,6 +70,7 @@ class QueueStoreFailure extends Schema.TaggedError<QueueStoreFailure>()(
 
 interface QueueKeys {
   readonly counterKey: Uint8Array;
+  readonly signalKey: Uint8Array;
   readonly entries: Subspace;
   readonly ids: Subspace;
   readonly pending: Subspace;
@@ -64,6 +84,11 @@ interface ClaimedEntry {
   readonly claimId: string;
   readonly sequence: bigint;
   readonly entry: QueueEntry;
+}
+
+interface ClaimWait {
+  readonly _tag: "ClaimWait";
+  readonly wake: FoundationDbFuture<void>;
 }
 
 const encodeSequence = (value: bigint): Effect.Effect<Uint8Array, TupleError> =>
@@ -116,6 +141,7 @@ const queueKeys = Effect.fnUntraced(function* (
 ) {
   return {
     counterKey: yield* directory.pack(["counter"]),
+    signalKey: yield* directory.pack(["signal"]),
     entries: yield* directory.subspace(["entries"]),
     ids: yield* directory.subspace(["ids"]),
     pending: yield* directory.subspace(["pending"]),
@@ -126,33 +152,89 @@ const queueKeys = Effect.fnUntraced(function* (
   } satisfies QueueKeys;
 });
 
+const decodeUtf8 = (value: Uint8Array) =>
+  Effect.try({
+    try: () => decoder.decode(value),
+    catch: (cause) =>
+      new QueueStoreFailure({ reason: `invalid UTF-8: ${String(cause)}` }),
+  });
+
+const readEntryMetadata = Effect.fnUntraced(function* (
+  entries: Subspace,
+  sequence: bigint,
+): Effect.fn.Return<
+  QueueEntryMetadata | undefined,
+  unknown,
+  FoundationDbTransaction
+> {
+  const transaction = yield* FoundationDbTransaction;
+  const metadataKey = yield* entries.pack([sequence, "metadata"]);
+  const encoded = yield* transaction.get(metadataKey);
+  if (encoded === undefined) {
+    return undefined;
+  }
+  return yield* decodeQueueEntryMetadata(yield* decodeUtf8(encoded));
+});
+
 const readEntry = Effect.fnUntraced(function* (
-  key: Uint8Array,
+  entries: Subspace,
+  sequence: bigint,
 ): Effect.fn.Return<
   QueueEntry | undefined,
   unknown,
   FoundationDbTransaction
 > {
   const transaction = yield* FoundationDbTransaction;
-  const value = yield* transaction.get(key);
-  if (value === undefined) {
+  const [metadata, encodedElement] = yield* Effect.all([
+    readEntryMetadata(entries, sequence),
+    readChunkedValue(transaction, entries, [sequence, "element"]),
+  ]);
+  if (metadata === undefined && encodedElement === undefined) {
     return undefined;
   }
-  const json = yield* Effect.try({
-    try: () => decoder.decode(value),
-    catch: (cause) =>
-      new QueueStoreFailure({ reason: `invalid UTF-8: ${String(cause)}` }),
-  });
-  return yield* decodeQueueEntry(json);
+  if (metadata === undefined || encodedElement === undefined) {
+    return yield* new QueueStoreFailure({
+      reason: "incomplete persisted queue entry",
+    });
+  }
+  const element = yield* decodeQueueElement(yield* decodeUtf8(encodedElement));
+  return { ...metadata, element };
 });
 
-const writeEntry = Effect.fnUntraced(function* (
-  key: Uint8Array,
+const writeEntryMetadata = Effect.fnUntraced(function* (
+  entries: Subspace,
+  sequence: bigint,
+  entry: QueueEntryMetadata,
+): Effect.fn.Return<void, unknown, FoundationDbTransaction> {
+  const transaction = yield* FoundationDbTransaction;
+  const metadata = yield* encodeQueueEntryMetadata(entry);
+  yield* transaction.set(
+    yield* entries.pack([sequence, "metadata"]),
+    encoder.encode(metadata),
+  );
+});
+
+const createEntry = Effect.fnUntraced(function* (
+  entries: Subspace,
+  sequence: bigint,
   entry: QueueEntry,
 ): Effect.fn.Return<void, unknown, FoundationDbTransaction> {
   const transaction = yield* FoundationDbTransaction;
-  const value = yield* encodeQueueEntry(entry);
-  yield* transaction.set(key, encoder.encode(value));
+  yield* writeEntryMetadata(entries, sequence, entry);
+  yield* writeChunkedValue(
+    transaction,
+    entries,
+    [sequence, "element"],
+    encoder.encode(yield* encodeQueueElement(entry.element)),
+  );
+});
+
+const clearEntry = Effect.fnUntraced(function* (
+  entries: Subspace,
+  sequence: bigint,
+): Effect.fn.Return<void, unknown, FoundationDbTransaction> {
+  const transaction = yield* FoundationDbTransaction;
+  yield* clearChunkedValue(transaction, entries, [sequence]);
 });
 
 const indexBefore = Effect.fnUntraced(function* (
@@ -180,7 +262,9 @@ const indexBefore = Effect.fnUntraced(function* (
 const addDelay = (now: number, delay: Duration.Duration): number => {
   const milliseconds = Duration.toMillis(delay);
   return Number.isFinite(milliseconds)
-    ? Math.min(Number.MAX_SAFE_INTEGER, now + Math.max(0, milliseconds))
+    ? Math.ceil(
+      Math.min(Number.MAX_SAFE_INTEGER, now + Math.max(0, milliseconds)),
+    )
     : Number.MAX_SAFE_INTEGER;
 };
 
@@ -197,6 +281,7 @@ export const makeQueueRepository = Effect.fnUntraced(function* (
     Duration.millis(1),
   );
   const transactionOptions: TransactionOptions = {
+    ...options.transactionOptions,
     timeoutMs: options.transactionOptions?.timeoutMs ?? 5_000,
     retryLimit: options.transactionOptions?.retryLimit ?? 10,
     maxRetryDelayMs: options.transactionOptions?.maxRetryDelayMs ?? 1_000,
@@ -250,7 +335,7 @@ export const makeQueueRepository = Effect.fnUntraced(function* (
           updatedAt: now,
         };
         const sequenceValue = yield* encodeSequence(sequence);
-        yield* writeEntry(yield* keys.entries.pack([sequence]), entry);
+        yield* createEntry(keys.entries, sequence, entry);
         yield* transaction.set(idKey, sequenceValue);
         yield* transaction.set(
           yield* keys.pending.pack([timestamp(now), sequence]),
@@ -259,6 +344,11 @@ export const makeQueueRepository = Effect.fnUntraced(function* (
         yield* transaction.set(
           keys.counterKey,
           yield* encodeSequence(sequence + 1n),
+        );
+        yield* transaction.atomicOp(
+          keys.signalKey,
+          signalIncrement,
+          MutationType.Add,
         );
       }),
       transactionOptions,
@@ -279,7 +369,7 @@ export const makeQueueRepository = Effect.fnUntraced(function* (
         const previousClaim = yield* transaction.get(claimKey);
         if (previousClaim !== undefined) {
           const sequence = yield* decodeSequence(previousClaim);
-          const entry = yield* readEntry(yield* keys.entries.pack([sequence]));
+          const entry = yield* readEntry(keys.entries, sequence);
           if (
             entry !== undefined && entry.state === "processing" &&
             entry.acquiredBy === claimId
@@ -292,10 +382,10 @@ export const makeQueueRepository = Effect.fnUntraced(function* (
         const expiredAt = now - Duration.toMillis(lockExpiration);
         const expired = yield* indexBefore(keys.locks, expiredAt);
         let progressed = expired.length > 0;
+        let recoveredPending = false;
         for (const lock of expired) {
           const sequence = yield* decodeSequence(lock.value);
-          const entryKey = yield* keys.entries.pack([sequence]);
-          const entry = yield* readEntry(entryKey);
+          const entry = yield* readEntryMetadata(keys.entries, sequence);
           if (
             entry === undefined || entry.state !== "processing" ||
             entry.acquiredAt === null ||
@@ -310,7 +400,7 @@ export const makeQueueRepository = Effect.fnUntraced(function* (
               yield* keys.claims.pack([entry.acquiredBy]),
             );
           }
-          const recovered: QueueEntry = entry.attempts >= maxAttempts
+          const recovered: QueueEntryMetadata = entry.attempts >= maxAttempts
             ? {
               ...entry,
               state: "failed",
@@ -326,11 +416,19 @@ export const makeQueueRepository = Effect.fnUntraced(function* (
               acquiredBy: null,
               updatedAt: now,
             };
-          yield* writeEntry(entryKey, recovered);
+          yield* writeEntryMetadata(keys.entries, sequence, recovered);
           yield* transaction.set(
             yield* (recovered.state === "failed" ? keys.failed : keys.pending)
               .pack([timestamp(now), sequence]),
             yield* encodeSequence(sequence),
+          );
+          recoveredPending = recoveredPending || recovered.state === "pending";
+        }
+        if (recoveredPending) {
+          yield* transaction.atomicOp(
+            keys.signalKey,
+            signalIncrement,
+            MutationType.Add,
           );
         }
 
@@ -338,13 +436,20 @@ export const makeQueueRepository = Effect.fnUntraced(function* (
         progressed = progressed || pending.length > 0;
         for (const candidate of pending) {
           const sequence = yield* decodeSequence(candidate.value);
-          const entryKey = yield* keys.entries.pack([sequence]);
-          const entry = yield* readEntry(entryKey);
-          if (
-            entry === undefined || entry.state !== "pending" ||
-            entry.visibleAt > now
-          ) {
+          const entry = yield* readEntry(keys.entries, sequence);
+          if (entry === undefined || entry.state !== "pending") {
             yield* transaction.clear(candidate.key);
+            continue;
+          }
+          if (entry.visibleAt > now) {
+            yield* transaction.clear(candidate.key);
+            yield* transaction.set(
+              yield* keys.pending.pack([
+                timestamp(Math.ceil(entry.visibleAt)),
+                sequence,
+              ]),
+              yield* encodeSequence(sequence),
+            );
             continue;
           }
           if (entry.attempts >= maxAttempts) {
@@ -354,7 +459,7 @@ export const makeQueueRepository = Effect.fnUntraced(function* (
               updatedAt: now,
             };
             yield* transaction.clear(candidate.key);
-            yield* writeEntry(entryKey, failed);
+            yield* writeEntryMetadata(keys.entries, sequence, failed);
             yield* transaction.set(
               yield* keys.failed.pack([timestamp(now), sequence]),
               yield* encodeSequence(sequence),
@@ -371,7 +476,7 @@ export const makeQueueRepository = Effect.fnUntraced(function* (
             updatedAt: now,
           };
           yield* transaction.clear(candidate.key);
-          yield* writeEntry(entryKey, processing);
+          yield* writeEntryMetadata(keys.entries, sequence, processing);
           yield* transaction.set(
             yield* keys.locks.pack([timestamp(now), sequence]),
             yield* encodeSequence(sequence),
@@ -386,7 +491,13 @@ export const makeQueueRepository = Effect.fnUntraced(function* (
             entry: processing,
           } satisfies ClaimedEntry;
         }
-        return progressed;
+        if (progressed) {
+          return true;
+        }
+        return {
+          _tag: "ClaimWait",
+          wake: yield* transaction.watch(keys.signalKey),
+        } satisfies ClaimWait;
       }),
       transactionOptions,
     );
@@ -401,8 +512,7 @@ export const makeQueueRepository = Effect.fnUntraced(function* (
       Effect.gen(function* () {
         const transaction = yield* FoundationDbTransaction;
         const keys = yield* keysForQueue(name);
-        const entryKey = yield* keys.entries.pack([claimed.sequence]);
-        const entry = yield* readEntry(entryKey);
+        const entry = yield* readEntryMetadata(keys.entries, claimed.sequence);
         if (
           entry === undefined || entry.state !== "processing" ||
           entry.acquiredBy !== claimed.claimId || entry.acquiredAt === null
@@ -415,7 +525,7 @@ export const makeQueueRepository = Effect.fnUntraced(function* (
             claimed.sequence,
           ]),
         );
-        yield* writeEntry(entryKey, {
+        yield* writeEntryMetadata(keys.entries, claimed.sequence, {
           ...entry,
           acquiredAt: now,
         });
@@ -457,8 +567,7 @@ export const makeQueueRepository = Effect.fnUntraced(function* (
       Effect.gen(function* () {
         const transaction = yield* FoundationDbTransaction;
         const keys = yield* keysForQueue(name);
-        const entryKey = yield* keys.entries.pack([claimed.sequence]);
-        const entry = yield* readEntry(entryKey);
+        const entry = yield* readEntryMetadata(keys.entries, claimed.sequence);
         if (
           entry === undefined || entry.state !== "processing" ||
           entry.acquiredBy !== claimed.claimId || entry.acquiredAt === null
@@ -474,7 +583,7 @@ export const makeQueueRepository = Effect.fnUntraced(function* (
         yield* transaction.clear(
           yield* keys.claims.pack([claimed.claimId]),
         );
-        const updated: QueueEntry = {
+        const updated: QueueEntryMetadata = {
           ...entry,
           attempts: decrementAttempt
             ? Math.max(0, entry.attempts - 1)
@@ -485,7 +594,7 @@ export const makeQueueRepository = Effect.fnUntraced(function* (
           acquiredBy: null,
           updatedAt: now,
         };
-        yield* writeEntry(entryKey, updated);
+        yield* writeEntryMetadata(keys.entries, claimed.sequence, updated);
         if (state === "pending") {
           yield* transaction.set(
             yield* keys.pending.pack([
@@ -493,6 +602,11 @@ export const makeQueueRepository = Effect.fnUntraced(function* (
               claimed.sequence,
             ]),
             yield* encodeSequence(claimed.sequence),
+          );
+          yield* transaction.atomicOp(
+            keys.signalKey,
+            signalIncrement,
+            MutationType.Add,
           );
         } else {
           yield* transaction.set(
@@ -523,13 +637,12 @@ export const makeQueueRepository = Effect.fnUntraced(function* (
           const entries = yield* indexBefore(index, cutoff);
           for (const indexed of entries) {
             const sequence = yield* decodeSequence(indexed.value);
-            const entryKey = yield* keys.entries.pack([sequence]);
-            const entry = yield* readEntry(entryKey);
+            const entry = yield* readEntryMetadata(keys.entries, sequence);
             if (
               entry !== undefined && entry.state === state &&
               entry.updatedAt <= cutoff
             ) {
-              yield* transaction.clear(entryKey);
+              yield* clearEntry(keys.entries, sequence);
               yield* transaction.clear(yield* keys.ids.pack([entry.id]));
             }
             yield* transaction.clear(indexed.key);

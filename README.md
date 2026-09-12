@@ -117,7 +117,13 @@ would lose FoundationDB's transaction state.
 
 `transactionDefaults` on `FoundationDb.layer` establishes the policy for every
 transaction. Options supplied to `withTransaction` or a convenience method
-override individual default fields.
+override individual default fields. In addition to timeout and retry controls,
+`reportConflictingKeys: true` makes ranges from a failed commit available as
+`transaction.conflictingKeyRanges` on the next attempt. By default, an ambiguous
+`commit_unknown_result` retries and the next attempt has
+`transaction.maybeCommitted === true`. Set `retryOnMaybeCommitted: false` for
+non-idempotent state transitions that must return the ambiguous error rather
+than risk applying the transition twice.
 
 ```ts
 const updateValue = database.withTransaction(
@@ -134,6 +140,33 @@ const updateValue = database.withTransaction(
   { timeoutMs: 5_000, retryLimit: 10, maxRetryDelayMs: 1_000 },
 );
 ```
+
+Use `withTransactionResult` when the commit version is part of the result. It
+returns `{ value, committedVersion }`, where versions are `bigint` and a
+read-only transaction has committed version `-1n`.
+
+Watches and commit versionstamps are post-commit futures. Start the native
+future inside the transaction, return it, and await it only after
+`withTransaction` commits:
+
+```ts
+const future = yield * database.withTransaction(
+  Effect.flatMap(
+    FoundationDbTransaction,
+    (transaction) => transaction.getVersionstamp(),
+  ),
+);
+const transactionVersion = yield * future.await.pipe(
+  Effect.onInterrupt(() => future.cancel),
+); // 10 bytes
+```
+
+Awaiting a transactional watch or versionstamp inside the transaction body would
+wait for a commit that cannot start until the body returns. Failed attempts
+cancel their futures automatically. After a successful commit, cancel an unused
+future explicitly; interrupting `future.await` does not cancel the underlying
+future. `database.watch(key)` manages its own transaction and cancellation when
+a standalone watch is sufficient.
 
 For many point reads, use `getMany` rather than creating one Effect and one FFI
 call per key. It preserves input order, represents missing values as
@@ -254,18 +287,79 @@ which `foundationdb-tuple` itself does not support.
 
 `FoundationDb` provides:
 
-- `withTransaction`, which satisfies the `FoundationDbTransaction` dependency
+- `withTransaction`, which satisfies the `FoundationDbTransaction` dependency,
+  and `withTransactionResult`, which also returns the committed version
 - transactional and convenience `get`, `set`, `clear`, and `clearRange`
+- batched `getMany`, key-selector reads, and snapshot reads
 - incremental transactional `getRange` streams
 - a convenience `database.getRange` effect that returns the complete retriable
   read as an array; process `transaction.getRange` inside `withTransaction` when
   incremental delivery matters
+- all non-deprecated FoundationDB 7.4 atomic mutations through `atomicOp` and
+  `MutationType`
+- generic, read, and write conflict-range controls through `ConflictRangeType`
+- `getReadVersion`, `setReadVersion`, and `getApproximateSize`, with native
+  64-bit values represented as `bigint`
+- transaction and standalone key watches
+- transaction versionstamp futures and server-filled versionstamped key/value
+  mutations for values produced by `packWithVersionstamp`
+- optional conflicting-key reports on retries
 - key selectors through `KeySelector`
-- transaction timeout, retry-limit, and maximum-retry-delay options
+- transaction timeout, retry-limit, maximum-retry-delay, and conflict-reporting
+  options
 - range limit, target-byte, streaming-mode, reverse, and snapshot options
 
 Keys and values are binary `Uint8Array`s. A missing value is `undefined`; an
 empty value is an empty `Uint8Array`.
+
+## Effect persistence backends
+
+The package provides FoundationDB layers for Effect's `KeyValueStore`,
+`BackingPersistence`, and `RateLimiterStore` contracts:
+
+```ts
+import { Layer } from "effect";
+import { Persistence, RateLimiter } from "effect/unstable/persistence";
+import {
+  FoundationDb,
+  layerBackingPersistence,
+  layerFoundationDB,
+  layerRateLimiterStore,
+} from "./mod.ts";
+
+const foundationDbLayer = FoundationDb.layer({
+  libraryPath: "./target/release/libeffect_foundationdb_native.so",
+});
+
+const keyValueLayer = layerFoundationDB().pipe(
+  Layer.provide(foundationDbLayer),
+);
+const persistenceLayer = Persistence.layer.pipe(
+  Layer.provide(layerBackingPersistence()),
+  Layer.provide(foundationDbLayer),
+);
+const rateLimiterLayer = RateLimiter.layer.pipe(
+  Layer.provide(layerRateLimiterStore()),
+  Layer.provide(foundationDbLayer),
+);
+```
+
+`layerFoundationDB` stores text and binary values in typed 8 KiB chunks and
+tracks the number of logical entries as metadata, so `size` and `isEmpty` use a
+point read rather than scanning stored values. Its `modify` operations are
+transactional across processes. Values remain subject to FoundationDB's total
+transaction-size limit. `layerBackingPersistence` provides named, isolated
+stores with ordered batch reads and writes, chunked values, logical TTLs, and
+background expiration cleanup. It powers Effect's `Persistence`,
+`PersistedCache`, and persisted AI chat APIs. `layerRateLimiterStore`
+transactionally implements fixed-window, token-bucket, and adaptive rate
+limiting. Rate-limit and TTL calculations use client wall clock time, so
+machines sharing a store should synchronize their clocks.
+
+Each layer accepts `directory`, `directoryPath`, and `transactionOptions`. Their
+default Directory Layer roots are below `effect-foundationdb` and do not
+overlap. Transactions use the same bounded retry defaults as the persisted queue
+backend.
 
 ## Effect PersistedQueue backend
 
@@ -317,6 +411,14 @@ worker crashes. Handler failures use `PersistedQueue`'s retry schedule,
 interruptions release a claim without consuming an attempt, and exhausted or
 undecodable entries are retained as failed records.
 
+Idle workers use FoundationDB watches to wake immediately when another process
+offers or requeues work. The watch is armed transactionally with the empty queue
+scan, preventing missed notifications. `pollInterval` remains a fallback for
+watch failures and time-driven visibility changes such as delayed retries and
+expired claim leases. Queue elements are stored in 8 KiB chunks; state metadata
+remains a small separate record so claiming and refreshing large elements does
+not rewrite their payload.
+
 Completed IDs remain de-duplicated until `PersistedQueue.layerCleanup` calls the
 store's TTL cleanup. Delivery is at least once, so handlers must be idempotent.
 `directory`, `directoryPath`, `pollInterval`, `lockRefreshInterval`,
@@ -341,6 +443,6 @@ deno task test:integration # requires a local cluster and /etc/foundationdb/fdb.
 
 The live integration test builds the debug bridge and covers binary and empty
 values, missing values, read-your-writes, key selectors, range order and limits,
-clears, and Effect `PersistedQueue` de-duplication, retries, and concurrent
-workers. It runs as one test because the FoundationDB network cannot restart
-inside one process.
+clears, Effect key-value storage, backing persistence, rate limiting, and
+`PersistedQueue` de-duplication, retries, and concurrent workers. It runs as one
+test because the FoundationDB network cannot restart inside one process.

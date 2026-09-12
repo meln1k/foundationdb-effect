@@ -29,21 +29,21 @@ EFFECT_FOUNDATIONDB_OTLP_ENDPOINT=http://127.0.0.1:27686 \
 Each example uses a distinct `effect-foundationdb-example-*` service name.
 Metrics are not exported because GoTel does not expose an OTLP metrics endpoint.
 
-| Rust example            | TypeScript port         | Notes                                                                                                                     |
-| ----------------------- | ----------------------- | ------------------------------------------------------------------------------------------------------------------------- |
-| `atomic-op-counter.rs`  | `atomic-op-counter.ts`  | Native little-endian atomic add                                                                                           |
-| `blob.rs`               | `blob.ts`               | 100 random 10 KB chunked round trips                                                                                      |
-| `blob-with-manifest.rs` | `blob-with-manifest.ts` | Uses a generated payload instead of the upstream image asset; verifies all chunk sizes, including the default             |
-| `budgeted_scan.rs`      | `budgeted_scan.ts`      | Uses application-observed row bytes and elapsed time because native client-budget accounting is not exposed               |
-| `class-scheduling.rs`   | `class-scheduling.ts`   | Typed domain errors and 10 concurrent Effect fibers sharing one scoped native layer                                       |
-| `conflict_reporting.rs` | `conflict_reporting.ts` | Produces a real retryable conflict and exposes `transaction.attempt`; native conflict-range hooks/reports are not exposed |
-| `hello-world.rs`        | `hello-world.ts`        | Direct port                                                                                                               |
-| `instrumented.rs`       | `instrumented.ts`       | Uses Effect spans and metrics; native `TransactionMetrics` is not exposed                                                 |
-| `key_selectors.rs`      | `key_selectors.ts`      | All 20 selector scenarios with exact equality checks; corrects the upstream `(a,true,2)` to `(g,false,0)` expectation     |
-| `micro-queue.rs`        | `micro-queue.ts`        | Preserves the upstream reverse-range behavior, so it drains last-in-first-out despite the upstream FIFO description       |
-| `multi_version.rs`      | `multi_version.ts`      | Ports the counter operation; external-client multi-version network configuration and read-version warmup are not exposed  |
-| `simple-index.rs`       | `simple-index.ts`       | Direct tuple/subspace index port                                                                                          |
-| `versionstamp.rs`       | `versionstamp.ts`       | Demonstrates complete tuple versionstamp ordering and references; server-filled versionstamped mutations are not exposed  |
+| Rust example            | TypeScript port         | Notes                                                                                                                 |
+| ----------------------- | ----------------------- | --------------------------------------------------------------------------------------------------------------------- |
+| `atomic-op-counter.rs`  | `atomic-op-counter.ts`  | Native little-endian atomic add                                                                                       |
+| `blob.rs`               | `blob.ts`               | 100 random 10 KB chunked round trips                                                                                  |
+| `blob-with-manifest.rs` | `blob-with-manifest.ts` | Uses a generated payload instead of the upstream image asset; verifies all chunk sizes, including the default         |
+| `budgeted_scan.rs`      | `budgeted_scan.ts`      | Uses application-observed row bytes and elapsed time because native client-budget accounting is not exposed           |
+| `class-scheduling.rs`   | `class-scheduling.ts`   | Typed domain errors and 10 concurrent Effect fibers sharing one scoped native layer                                   |
+| `conflict_reporting.rs` | `conflict_reporting.ts` | Produces a real retryable conflict and reports the conflicting key ranges to the next attempt                         |
+| `hello-world.rs`        | `hello-world.ts`        | Direct port                                                                                                           |
+| `instrumented.rs`       | `instrumented.ts`       | Uses Effect spans and metrics; native `TransactionMetrics` is not exposed                                             |
+| `key_selectors.rs`      | `key_selectors.ts`      | All 20 selector scenarios with exact equality checks; corrects the upstream `(a,true,2)` to `(g,false,0)` expectation |
+| `micro-queue.rs`        | `micro-queue.ts`        | Preserves the upstream reverse-range behavior, so it drains last-in-first-out despite the upstream FIFO description   |
+| `multi_version.rs`      | `multi_version.ts`      | Uses explicit read versions; external-client multi-version network configuration is not exposed                       |
+| `simple-index.rs`       | `simple-index.ts`       | Direct tuple/subspace index port                                                                                      |
+| `versionstamp.rs`       | `versionstamp.ts`       | Server-filled versionstamped keys and values, post-commit version retrieval, tuple ordering, and references           |
 
 Run `deno task check:examples` to type-check every example without connecting to
 FoundationDB.

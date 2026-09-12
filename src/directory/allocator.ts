@@ -1,5 +1,6 @@
 import { Effect, Semaphore } from "effect";
 import { FoundationDbTransaction } from "../FoundationDb.ts";
+import { MutationType } from "../model.ts";
 import type { Bytes } from "../model.ts";
 import {
   allocatorWindow,
@@ -106,7 +107,7 @@ const allocatePrefixLocked = (
             recentStart.prefix,
           );
         }
-        yield* transaction.atomicAdd(counter.prefix, ONE);
+        yield* transaction.atomicOp(counter.prefix, ONE, MutationType.Add);
         const encodedCount = yield* transaction.get(counter.prefix, {
           snapshot: true,
         });

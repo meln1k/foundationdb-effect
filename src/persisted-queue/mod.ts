@@ -62,10 +62,24 @@ export const makePersistedQueueStore = Effect.fnUntraced(function* (
             claimId,
             takeOptions.maxAttempts,
           );
-          if (typeof result === "boolean") {
-            if (!result) {
-              yield* Effect.race(latch.await, Effect.sleep(pollInterval));
-            }
+          if (result === true) {
+            continue;
+          }
+          if (result._tag === "ClaimWait") {
+            const remoteWake = result.wake.await.pipe(
+              Effect.matchEffect({
+                onFailure: (error) =>
+                  Effect.logWarning(error).pipe(
+                    Effect.andThen(Effect.sleep(pollInterval)),
+                  ),
+                onSuccess: () => Effect.void,
+              }),
+            );
+            yield* Effect.raceAll([
+              latch.await,
+              remoteWake,
+              Effect.sleep(pollInterval),
+            ]).pipe(Effect.ensuring(result.wake.cancel));
             continue;
           }
           return result;

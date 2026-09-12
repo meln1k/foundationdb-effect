@@ -1,11 +1,24 @@
 import { assert, assertEquals } from "@std/assert";
-import { Cause, Effect, Exit, Layer, Option, Stream, Tracer } from "effect";
 import {
+  Cause,
+  Effect,
+  Exit,
+  Fiber,
+  Latch,
+  Layer,
+  Option,
+  Stream,
+  Tracer,
+} from "effect";
+import {
+  ConflictRange,
+  ConflictRangeType,
   FoundationDb,
   FoundationDbTransaction,
   keyRange,
   KeySelector,
   KeyValue,
+  MutationType,
   StreamingMode,
 } from "../../mod.ts";
 import { NativeDriver } from "../../src/internal/native.ts";
@@ -114,7 +127,7 @@ Deno.test("transaction forwards options and all primitive operations", async () 
             snapshot: true,
           });
           yield* transaction.set(key, value);
-          yield* transaction.atomicAdd(key, operand);
+          yield* transaction.atomicOp(key, operand, MutationType.Add);
           yield* transaction.setWithoutWriteConflict(key, value);
           yield* transaction.clear(key);
           yield* transaction.clearRange(key, end);
@@ -137,7 +150,7 @@ Deno.test("transaction forwards options and all primitive operations", async () 
   assertEquals(state.getMany, [[2n, [key, end], true]]);
   assertEquals(state.getKeys, [[2n, selector, true]]);
   assertEquals(state.sets, [[2n, key, value]]);
-  assertEquals(state.atomicAdds, [[2n, key, operand]]);
+  assertEquals(state.atomicOps, [[2n, key, operand, MutationType.Add]]);
   assertEquals(state.setsWithoutWriteConflict, [[2n, key, value]]);
   assertEquals(state.clears, [[2n, key]]);
   assertEquals(state.clearRanges, [[2n, key, end]]);
@@ -145,6 +158,259 @@ Deno.test("transaction forwards options and all primitive operations", async () 
   assertEquals(state.writeConflictRanges, [[2n, key, end]]);
   assertEquals(state.commits, [2n]);
   assertEquals(state.closeTransaction, [2n]);
+});
+
+Deno.test("transaction exposes atomic, conflict, version, and size primitives", async () => {
+  const { driver, state } = makeFakeDriver();
+  const key = bytes(1, 2);
+  const end = bytes(9);
+  const operand = bytes(3, 4, 5);
+  state.readVersionResults.push(9_007_199_254_740_993n);
+  state.approximateSizeResults.push(12_345n);
+  state.committedVersionResults.push(9_007_199_254_740_995n);
+
+  const actual = await runWith(
+    driver,
+    withDatabase((database) =>
+      database.withTransactionResult(
+        Effect.gen(function* () {
+          const transaction = yield* FoundationDbTransaction;
+          yield* transaction.atomicOp(key, operand, MutationType.ByteMax);
+          yield* transaction.addReadConflictRange(key, end);
+          yield* transaction.addConflictRange(
+            key,
+            end,
+            ConflictRangeType.Write,
+          );
+          const readVersion = yield* transaction.getReadVersion();
+          yield* transaction.setReadVersion(9_007_199_254_740_991n);
+          const approximateSize = yield* transaction.getApproximateSize();
+          return { readVersion, approximateSize };
+        }),
+      )
+    ),
+  );
+
+  assertEquals(actual, {
+    value: {
+      readVersion: 9_007_199_254_740_993n,
+      approximateSize: 12_345n,
+    },
+    committedVersion: 9_007_199_254_740_995n,
+  });
+  assertEquals(state.atomicOps, [[2n, key, operand, MutationType.ByteMax]]);
+  assertEquals(state.conflictRanges, [
+    [2n, key, end, ConflictRangeType.Read],
+    [2n, key, end, ConflictRangeType.Write],
+  ]);
+  assertEquals(state.getReadVersions, [2n]);
+  assertEquals(state.setReadVersions, [[2n, 9_007_199_254_740_991n]]);
+  assertEquals(state.getApproximateSizes, [2n]);
+});
+
+Deno.test("versionstamp futures start before commit and resolve after it", async () => {
+  const { driver, state } = makeFakeDriver();
+  const committed = Latch.makeUnsafe(false);
+  const versionstamp = bytes(0, 1, 2, 3, 4, 5, 6, 7, 8, 9);
+  const checkedDriver: NativeDriverShape = {
+    ...driver,
+    getVersionstamp: (handle) => {
+      state.getVersionstamps.push(handle);
+      return Effect.andThen(committed.await, Effect.succeed(versionstamp));
+    },
+    commit: (handle) =>
+      Effect.sync(() => assertEquals(state.getVersionstamps, [handle])).pipe(
+        Effect.andThen(driver.commit(handle)),
+        Effect.tap(() => committed.open),
+      ),
+  };
+
+  const future = await runWith(
+    checkedDriver,
+    withDatabase((database) =>
+      database.withTransaction(
+        Effect.flatMap(FoundationDbTransaction, (transaction) =>
+          transaction.getVersionstamp()),
+      )
+    ),
+  );
+
+  assertEquals(await Effect.runPromise(future.await), versionstamp);
+  assertEquals(state.getVersionstamps, [2n]);
+  assertEquals(state.commits, [2n]);
+});
+
+Deno.test("database watch commits its transaction before awaiting a change", async () => {
+  const { driver, state } = makeFakeDriver();
+  const committed = Latch.makeUnsafe(false);
+  const key = bytes(7, 8);
+  const checkedDriver: NativeDriverShape = {
+    ...driver,
+    watch: (handle, watchedKey) => {
+      state.watches.push([handle, watchedKey]);
+      return committed.await;
+    },
+    commit: (handle) =>
+      Effect.sync(() => assertEquals(state.watches, [[handle, key]])).pipe(
+        Effect.andThen(driver.commit(handle)),
+        Effect.tap(() => committed.open),
+      ),
+  };
+
+  await runWith(
+    checkedDriver,
+    withDatabase((database) => database.watch(key)),
+  );
+
+  assertEquals(state.watches, [[2n, key]]);
+  assertEquals(state.commits, [2n]);
+});
+
+Deno.test("interrupting a database watch cancels its native future", async () => {
+  const { driver, state } = makeFakeDriver();
+  const committed = Latch.makeUnsafe(false);
+  let cancellations = 0;
+  const checkedDriver: NativeDriverShape = {
+    ...driver,
+    watch: () =>
+      Effect.never.pipe(
+        Effect.onInterrupt(() =>
+          Effect.sync(() => {
+            cancellations += 1;
+          })
+        ),
+      ),
+    commit: (handle) =>
+      driver.commit(handle).pipe(
+        Effect.tap(() => committed.open),
+      ),
+  };
+
+  await runWith(
+    checkedDriver,
+    withDatabase((database) =>
+      Effect.gen(function* () {
+        const fiber = yield* Effect.forkChild(database.watch(bytes(1)));
+        yield* committed.await;
+        yield* Fiber.interrupt(fiber);
+      })
+    ),
+  );
+
+  assertEquals(cancellations, 1);
+  assertEquals(state.commits, [2n]);
+});
+
+Deno.test("failed attempts cancel their post-commit futures before retry", async () => {
+  const { driver, state } = makeFakeDriver();
+  const commitFailure = fdbError("Transaction.commit", { code: 1020 });
+  state.commitFailures.push(commitFailure);
+  let cancellations = 0;
+  const checkedDriver: NativeDriverShape = {
+    ...driver,
+    watch: () =>
+      Effect.never.pipe(
+        Effect.onInterrupt(() =>
+          Effect.sync(() => {
+            cancellations += 1;
+          })
+        ),
+      ),
+    onError: (handle, error) =>
+      Effect.sync(() => assertEquals(cancellations, 1)).pipe(
+        Effect.andThen(driver.onError(handle, error)),
+      ),
+  };
+
+  const future = await runWith(
+    checkedDriver,
+    withDatabase((database) =>
+      database.withTransaction(
+        Effect.flatMap(FoundationDbTransaction, (transaction) =>
+          transaction.watch(bytes(1))),
+      )
+    ),
+  );
+  await Effect.runPromise(future.cancel);
+
+  assertEquals(cancellations, 2);
+  assertEquals(state.commits, [2n, 2n]);
+});
+
+Deno.test("interrupting commit cancels post-commit futures", async () => {
+  const { driver, state } = makeFakeDriver();
+  const commitStarted = Latch.makeUnsafe(false);
+  const releaseWatch = Latch.makeUnsafe(false);
+  const releases: Array<string> = [];
+  let cancellations = 0;
+  const checkedDriver: NativeDriverShape = {
+    ...driver,
+    watch: () =>
+      releaseWatch.await.pipe(
+        Effect.onInterrupt(() =>
+          Effect.sync(() => {
+            cancellations += 1;
+            releases.push("cancel future");
+          })
+        ),
+      ),
+    commit: (handle) =>
+      Effect.sync(() => state.commits.push(handle)).pipe(
+        Effect.andThen(commitStarted.open),
+        Effect.andThen(Effect.never),
+      ),
+    closeTransaction: (handle) =>
+      Effect.sync(() => releases.push("close transaction")).pipe(
+        Effect.andThen(driver.closeTransaction(handle)),
+      ),
+  };
+
+  await runWith(
+    checkedDriver,
+    withDatabase((database) =>
+      Effect.gen(function* () {
+        const fiber = yield* Effect.forkChild(database.withTransaction(
+          Effect.flatMap(FoundationDbTransaction, (transaction) =>
+            transaction.watch(bytes(1))),
+        ));
+        yield* commitStarted.await;
+        yield* Fiber.interrupt(fiber);
+      })
+    ),
+  );
+
+  const observedCancellations = cancellations;
+  await Effect.runPromise(releaseWatch.open);
+  assertEquals(observedCancellations, 1);
+  assertEquals(releases, ["cancel future", "close transaction"]);
+  assertEquals(state.commits, [2n]);
+  assertEquals(state.closeTransaction, [2n]);
+});
+
+Deno.test("reported conflicting ranges are available to the next attempt", async () => {
+  const { driver, state } = makeFakeDriver();
+  const commitFailure = fdbError("Transaction.commit", { code: 1020 });
+  const conflict = new ConflictRange({ begin: bytes(1), end: bytes(4) });
+  state.commitFailures.push(commitFailure);
+  state.conflictingKeyRangeResults.push([conflict]);
+  const attempts: Array<ReadonlyArray<ConflictRange>> = [];
+
+  await runWith(
+    driver,
+    withDatabase((database) =>
+      database.withTransaction(
+        Effect.gen(function* () {
+          const transaction = yield* FoundationDbTransaction;
+          attempts.push(transaction.conflictingKeyRanges);
+        }),
+        { reportConflictingKeys: true },
+      )
+    ),
+  );
+
+  assertEquals(attempts, [[], [conflict]]);
+  assertEquals(state.options, [[2n, "reportConflictingKeys", 1]]);
+  assertEquals(state.getConflictingKeyRanges, [2n]);
 });
 
 Deno.test("transaction tracing aggregates local mutations and traces remote operations", async () => {
@@ -165,7 +431,7 @@ Deno.test("transaction tracing aggregates local mutations and traces remote oper
       database.withTransaction(Effect.gen(function* () {
         const transaction = yield* FoundationDbTransaction;
         yield* transaction.set(key, value);
-        yield* transaction.atomicAdd(key, operand);
+        yield* transaction.atomicOp(key, operand, MutationType.Add);
         yield* transaction.setWithoutWriteConflict(key, value);
         yield* transaction.clear(key);
         yield* transaction.clearRange(key, end);
@@ -185,7 +451,7 @@ Deno.test("transaction tracing aggregates local mutations and traces remote oper
     spans.filter((span) =>
       [
         "FoundationDb.Transaction.set",
-        "FoundationDb.Transaction.atomicAdd",
+        "FoundationDb.Transaction.atomicOp",
         "FoundationDb.Transaction.setWithoutWriteConflict",
         "FoundationDb.Transaction.clear",
         "FoundationDb.Transaction.clearRange",
@@ -350,13 +616,21 @@ Deno.test("transaction tracing exposes retries as sibling attempts", async () =>
 Deno.test("transaction options override database defaults field by field", async () => {
   const { driver, state } = makeFakeDriver();
   const program = withDatabase((database) =>
-    database.withTransaction(Effect.void, { retryLimit: 9 })
+    database.withTransaction(Effect.void, {
+      retryLimit: 9,
+      reportConflictingKeys: false,
+    })
   );
 
   await Effect.runPromise(program.pipe(Effect.provide(layerFor(
     driver,
     "test.cluster",
-    { timeoutMs: 500, retryLimit: 3, maxRetryDelayMs: 25 },
+    {
+      timeoutMs: 500,
+      retryLimit: 3,
+      maxRetryDelayMs: 25,
+      reportConflictingKeys: true,
+    },
   ))));
 
   assertEquals(state.options, [
@@ -400,6 +674,7 @@ Deno.test("transaction retries a body FoundationDB failure through onError", asy
           attempts.push({
             attempt: transaction.attempt,
             maybeCommitted: transaction.maybeCommitted,
+            conflictingKeyRanges: transaction.conflictingKeyRanges,
           });
           return yield* transaction.get(bytes(1));
         }),
@@ -409,8 +684,8 @@ Deno.test("transaction retries a body FoundationDB failure through onError", asy
 
   assertEquals(actual, value);
   assertEquals(attempts, [
-    { attempt: 1, maybeCommitted: false },
-    { attempt: 2, maybeCommitted: false },
+    { attempt: 1, maybeCommitted: false, conflictingKeyRanges: [] },
+    { attempt: 2, maybeCommitted: false, conflictingKeyRanges: [] },
   ]);
   assertEquals(state.onErrors, [[2n, firstFailure]]);
   assertEquals(state.commits, [2n]);
@@ -436,6 +711,7 @@ Deno.test("transaction retries commit failure and propagates maybeCommitted", as
           attempts.push({
             attempt: transaction.attempt,
             maybeCommitted: transaction.maybeCommitted,
+            conflictingKeyRanges: transaction.conflictingKeyRanges,
           });
           return "done";
         }),
@@ -445,11 +721,40 @@ Deno.test("transaction retries commit failure and propagates maybeCommitted", as
 
   assertEquals(actual, "done");
   assertEquals(attempts, [
-    { attempt: 1, maybeCommitted: false },
-    { attempt: 2, maybeCommitted: true },
+    { attempt: 1, maybeCommitted: false, conflictingKeyRanges: [] },
+    { attempt: 2, maybeCommitted: true, conflictingKeyRanges: [] },
   ]);
   assertEquals(state.commits, [2n, 2n]);
   assertEquals(state.onErrors, [[2n, commitFailure]]);
+});
+
+Deno.test("transaction can reject ambiguous commits without replaying", async () => {
+  const { driver, state } = makeFakeDriver();
+  const commitFailure = fdbError("Transaction.commit", {
+    code: 1021,
+    message: "commit_unknown_result",
+    maybeCommitted: true,
+    retryableNotCommitted: false,
+  });
+  state.commitFailures.push(commitFailure);
+  let executions = 0;
+
+  const failure = await runWith(
+    driver,
+    withDatabase((database) =>
+      database.withTransaction(
+        Effect.sync(() => {
+          executions += 1;
+        }),
+        { retryOnMaybeCommitted: false },
+      ).pipe(Effect.flip)
+    ),
+  );
+
+  assertEquals(failure, commitFailure);
+  assertEquals(executions, 1);
+  assertEquals(state.commits, [2n]);
+  assertEquals(state.onErrors, []);
 });
 
 Deno.test("maybeCommitted remains true across later retryable failures", async () => {
@@ -473,6 +778,7 @@ Deno.test("maybeCommitted remains true across later retryable failures", async (
           attempts.push({
             attempt: transaction.attempt,
             maybeCommitted: transaction.maybeCommitted,
+            conflictingKeyRanges: transaction.conflictingKeyRanges,
           });
           return transaction.attempt === 1
             ? bytes(1)
@@ -483,9 +789,9 @@ Deno.test("maybeCommitted remains true across later retryable failures", async (
   );
 
   assertEquals(attempts, [
-    { attempt: 1, maybeCommitted: false },
-    { attempt: 2, maybeCommitted: true },
-    { attempt: 3, maybeCommitted: true },
+    { attempt: 1, maybeCommitted: false, conflictingKeyRanges: [] },
+    { attempt: 2, maybeCommitted: true, conflictingKeyRanges: [] },
+    { attempt: 3, maybeCommitted: true, conflictingKeyRanges: [] },
   ]);
   assertEquals(state.onErrors, [
     [2n, commitFailure],

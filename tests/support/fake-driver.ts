@@ -7,7 +7,14 @@ import type {
   RangeHandle,
   TransactionHandle,
 } from "../../src/internal/native.ts";
-import type { Bytes, KeySelector, RangeOptions } from "../../src/model.ts";
+import type {
+  Bytes,
+  ConflictRange,
+  ConflictRangeType,
+  KeySelector,
+  MutationType as MutationTypeValue,
+  RangeOptions,
+} from "../../src/model.ts";
 
 export const fdbError = (
   operation: string,
@@ -30,7 +37,10 @@ export interface FakeDriverState {
   readonly options: Array<
     readonly [
       TransactionHandle,
-      "timeout" | "retryLimit" | "maxRetryDelay",
+      | "timeout"
+      | "retryLimit"
+      | "maxRetryDelay"
+      | "reportConflictingKeys",
       number,
     ]
   >;
@@ -40,7 +50,9 @@ export interface FakeDriverState {
   >;
   readonly getKeys: Array<readonly [TransactionHandle, KeySelector, boolean]>;
   readonly sets: Array<readonly [TransactionHandle, Bytes, Bytes]>;
-  readonly atomicAdds: Array<readonly [TransactionHandle, Bytes, Bytes]>;
+  readonly atomicOps: Array<
+    readonly [TransactionHandle, Bytes, Bytes, MutationTypeValue]
+  >;
   readonly setsWithoutWriteConflict: Array<
     readonly [TransactionHandle, Bytes, Bytes]
   >;
@@ -52,6 +64,15 @@ export interface FakeDriverState {
   readonly writeConflictRanges: Array<
     readonly [TransactionHandle, Bytes, Bytes]
   >;
+  readonly conflictRanges: Array<
+    readonly [TransactionHandle, Bytes, Bytes, ConflictRangeType]
+  >;
+  readonly getReadVersions: Array<TransactionHandle>;
+  readonly setReadVersions: Array<readonly [TransactionHandle, bigint]>;
+  readonly getApproximateSizes: Array<TransactionHandle>;
+  readonly watches: Array<readonly [TransactionHandle, Bytes]>;
+  readonly getVersionstamps: Array<TransactionHandle>;
+  readonly getConflictingKeyRanges: Array<TransactionHandle>;
   readonly openRanges: Array<readonly [TransactionHandle, RangeOptions]>;
   readonly nextRanges: Array<RangeHandle>;
   readonly closeRanges: Array<RangeHandle>;
@@ -63,6 +84,14 @@ export interface FakeDriverState {
   >;
   getKeyResults: Array<Uint8Array | FoundationDbError>;
   rangeBatches: Array<RangeBatch | FoundationDbError>;
+  readVersionResults: Array<bigint | FoundationDbError>;
+  approximateSizeResults: Array<bigint | FoundationDbError>;
+  watchResults: Array<void | FoundationDbError>;
+  versionstampResults: Array<Uint8Array | FoundationDbError>;
+  conflictingKeyRangeResults: Array<
+    ReadonlyArray<ConflictRange> | FoundationDbError
+  >;
+  committedVersionResults: Array<bigint>;
   commitFailures: Array<FoundationDbError>;
   onErrorFailures: Array<FoundationDbError>;
 }
@@ -91,12 +120,19 @@ export const makeFakeDriver = (): {
     getMany: [],
     getKeys: [],
     sets: [],
-    atomicAdds: [],
+    atomicOps: [],
     setsWithoutWriteConflict: [],
     clears: [],
     clearRanges: [],
     clearRangesWithoutWriteConflict: [],
     writeConflictRanges: [],
+    conflictRanges: [],
+    getReadVersions: [],
+    setReadVersions: [],
+    getApproximateSizes: [],
+    watches: [],
+    getVersionstamps: [],
+    getConflictingKeyRanges: [],
     openRanges: [],
     nextRanges: [],
     closeRanges: [],
@@ -106,6 +142,12 @@ export const makeFakeDriver = (): {
     getManyResults: [],
     getKeyResults: [],
     rangeBatches: [],
+    readVersionResults: [],
+    approximateSizeResults: [],
+    watchResults: [],
+    versionstampResults: [],
+    conflictingKeyRangeResults: [],
+    committedVersionResults: [],
     commitFailures: [],
     onErrorFailures: [],
   };
@@ -152,9 +194,9 @@ export const makeFakeDriver = (): {
       Effect.sync(() => {
         state.sets.push([handle, key, value]);
       }),
-    atomicAdd: (handle, key, value) =>
+    atomicOp: (handle, key, value, mutationType) =>
       Effect.sync(() => {
-        state.atomicAdds.push([handle, key, value]);
+        state.atomicOps.push([handle, key, value, mutationType]);
       }),
     setWithoutWriteConflict: (handle, key, value) =>
       Effect.sync(() => {
@@ -172,9 +214,43 @@ export const makeFakeDriver = (): {
       Effect.sync(() => {
         state.clearRangesWithoutWriteConflict.push([handle, begin, end]);
       }),
-    addWriteConflictRange: (handle, begin, end) =>
+    addConflictRange: (handle, begin, end, conflictType) =>
       Effect.sync(() => {
-        state.writeConflictRanges.push([handle, begin, end]);
+        state.conflictRanges.push([handle, begin, end, conflictType]);
+        if (conflictType === 1) {
+          state.writeConflictRanges.push([handle, begin, end]);
+        }
+      }),
+    getReadVersion: (handle) =>
+      Effect.suspend(() => {
+        state.getReadVersions.push(handle);
+        return result(state.readVersionResults.shift() ?? 0n);
+      }),
+    setReadVersion: (handle, version) =>
+      Effect.sync(() => {
+        state.setReadVersions.push([handle, version]);
+      }),
+    getApproximateSize: (handle) =>
+      Effect.suspend(() => {
+        state.getApproximateSizes.push(handle);
+        return result(state.approximateSizeResults.shift() ?? 0n);
+      }),
+    watch: (handle, key) =>
+      Effect.suspend(() => {
+        state.watches.push([handle, key]);
+        return result(state.watchResults.shift());
+      }),
+    getVersionstamp: (handle) =>
+      Effect.suspend(() => {
+        state.getVersionstamps.push(handle);
+        return result(
+          state.versionstampResults.shift() ?? new Uint8Array(10),
+        );
+      }),
+    getConflictingKeyRanges: (handle) =>
+      Effect.suspend(() => {
+        state.getConflictingKeyRanges.push(handle);
+        return result(state.conflictingKeyRangeResults.shift() ?? []);
       }),
     openRange: (handle, options) =>
       Effect.sync(() => {
@@ -196,7 +272,9 @@ export const makeFakeDriver = (): {
       Effect.suspend(() => {
         state.commits.push(handle);
         const failure = state.commitFailures.shift();
-        return failure === undefined ? Effect.void : Effect.fail(failure);
+        return failure === undefined
+          ? Effect.succeed(state.committedVersionResults.shift() ?? 1n)
+          : Effect.fail(failure);
       }),
     onError: (handle, error) =>
       Effect.suspend(() => {

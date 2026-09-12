@@ -1,6 +1,14 @@
 import { Context, Effect } from "effect";
 import type { FoundationDbError } from "../errors.ts";
-import type { Bytes, KeySelector, KeyValue, RangeOptions } from "../model.ts";
+import type {
+  Bytes,
+  ConflictRange,
+  ConflictRangeType,
+  KeySelector,
+  KeyValue,
+  MutationType,
+  RangeOptions,
+} from "../model.ts";
 
 export type DatabaseHandle = bigint;
 export type TransactionHandle = bigint;
@@ -26,7 +34,11 @@ export interface NativeDriverShape {
   ) => Effect.Effect<void, FoundationDbError>;
   readonly setTransactionOption: (
     handle: TransactionHandle,
-    option: "timeout" | "retryLimit" | "maxRetryDelay",
+    option:
+      | "timeout"
+      | "retryLimit"
+      | "maxRetryDelay"
+      | "reportConflictingKeys",
     value: number,
   ) => Effect.Effect<void, FoundationDbError>;
   readonly get: (
@@ -52,10 +64,11 @@ export interface NativeDriverShape {
     key: Bytes,
     value: Bytes,
   ) => Effect.Effect<void, FoundationDbError>;
-  readonly atomicAdd: (
+  readonly atomicOp: (
     handle: TransactionHandle,
     key: Bytes,
     value: Bytes,
+    mutationType: MutationType,
   ) => Effect.Effect<void, FoundationDbError>;
   readonly setWithoutWriteConflict: (
     handle: TransactionHandle,
@@ -76,11 +89,32 @@ export interface NativeDriverShape {
     begin: Bytes,
     end: Bytes,
   ) => Effect.Effect<void, FoundationDbError>;
-  readonly addWriteConflictRange: (
+  readonly addConflictRange: (
     handle: TransactionHandle,
     begin: Bytes,
     end: Bytes,
+    conflictType: ConflictRangeType,
   ) => Effect.Effect<void, FoundationDbError>;
+  readonly getReadVersion: (
+    handle: TransactionHandle,
+  ) => Effect.Effect<bigint, FoundationDbError>;
+  readonly setReadVersion: (
+    handle: TransactionHandle,
+    version: bigint,
+  ) => Effect.Effect<void, FoundationDbError>;
+  readonly getApproximateSize: (
+    handle: TransactionHandle,
+  ) => Effect.Effect<bigint, FoundationDbError>;
+  readonly watch: (
+    handle: TransactionHandle,
+    key: Bytes,
+  ) => Effect.Effect<void, FoundationDbError>;
+  readonly getVersionstamp: (
+    handle: TransactionHandle,
+  ) => Effect.Effect<Uint8Array, FoundationDbError>;
+  readonly getConflictingKeyRanges: (
+    handle: TransactionHandle,
+  ) => Effect.Effect<ReadonlyArray<ConflictRange>, FoundationDbError>;
   readonly openRange: (
     handle: TransactionHandle,
     options: RangeOptions,
@@ -93,7 +127,7 @@ export interface NativeDriverShape {
   ) => Effect.Effect<void, FoundationDbError>;
   readonly commit: (
     handle: TransactionHandle,
-  ) => Effect.Effect<void, FoundationDbError>;
+  ) => Effect.Effect<bigint, FoundationDbError>;
   readonly onError: (
     handle: TransactionHandle,
     error: FoundationDbError,

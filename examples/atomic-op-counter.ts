@@ -1,5 +1,10 @@
 import { Console, Effect } from "effect";
-import { FoundationDb, FoundationDbTransaction, Subspace } from "../mod.ts";
+import {
+  FoundationDb,
+  FoundationDbTransaction,
+  MutationType,
+  Subspace,
+} from "../mod.ts";
 import {
   assert,
   littleEndianInt64,
@@ -23,7 +28,12 @@ const program = Effect.gen(function* () {
   yield* database.withTransaction(
     Effect.flatMap(
       FoundationDbTransaction,
-      (transaction) => transaction.atomicAdd(counterKey, littleEndianInt64(1n)),
+      (transaction) =>
+        transaction.atomicOp(
+          counterKey,
+          littleEndianInt64(1n),
+          MutationType.Add,
+        ),
     ),
   );
 
@@ -35,7 +45,11 @@ const program = Effect.gen(function* () {
     Effect.flatMap(
       FoundationDbTransaction,
       (transaction) =>
-        transaction.atomicAdd(counterKey, littleEndianInt64(-1n)),
+        transaction.atomicOp(
+          counterKey,
+          littleEndianInt64(-1n),
+          MutationType.Add,
+        ),
     ),
   );
 

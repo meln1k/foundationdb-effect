@@ -1,4 +1,14 @@
-import { Cause, Context, Effect, Layer, Option, Scope, Stream } from "effect";
+import {
+  Cause,
+  Context,
+  Effect,
+  Exit,
+  Fiber,
+  Layer,
+  Option,
+  Scope,
+  Stream,
+} from "effect";
 import { FoundationDbError, isFoundationDbError } from "./errors.ts";
 import { ffiLayer } from "./internal/ffi.ts";
 import type { FfiOptions } from "./internal/ffi.ts";
@@ -10,12 +20,30 @@ import type {
 } from "./internal/native.ts";
 import type {
   Bytes,
+  ConflictRange,
+  ConflictRangeType,
   KeySelector,
   KeyValue,
+  MutationType,
   RangeOptions,
   TransactionAttempt,
   TransactionOptions,
 } from "./model.ts";
+import { ConflictRangeType as ConflictRangeTypes } from "./model.ts";
+
+/** A native future started in a transaction that may resolve after commit. */
+export interface FoundationDbFuture<A> {
+  /** Await the result after `withTransaction` has committed. */
+  readonly await: Effect.Effect<A, FoundationDbError>;
+  /** Explicitly release an unneeded future. Safe to call more than once. */
+  readonly cancel: Effect.Effect<void>;
+}
+
+export interface FoundationDbTransactionResult<A> {
+  readonly value: A;
+  /** The committed database version, or `-1n` for a read-only transaction. */
+  readonly committedVersion: bigint;
+}
 
 export interface FoundationDbTransactionShape extends TransactionAttempt {
   readonly get: (
@@ -38,9 +66,10 @@ export interface FoundationDbTransactionShape extends TransactionAttempt {
     key: Bytes,
     value: Bytes,
   ) => Effect.Effect<void, FoundationDbError>;
-  readonly atomicAdd: (
+  readonly atomicOp: (
     key: Bytes,
     value: Bytes,
+    mutationType: MutationType,
   ) => Effect.Effect<void, FoundationDbError>;
   readonly setWithoutWriteConflict: (
     key: Bytes,
@@ -59,6 +88,34 @@ export interface FoundationDbTransactionShape extends TransactionAttempt {
     begin: Bytes,
     end: Bytes,
   ) => Effect.Effect<void, FoundationDbError>;
+  readonly addReadConflictRange: (
+    begin: Bytes,
+    end: Bytes,
+  ) => Effect.Effect<void, FoundationDbError>;
+  readonly addConflictRange: (
+    begin: Bytes,
+    end: Bytes,
+    conflictType: ConflictRangeType,
+  ) => Effect.Effect<void, FoundationDbError>;
+  readonly getReadVersion: () => Effect.Effect<bigint, FoundationDbError>;
+  readonly setReadVersion: (
+    version: bigint,
+  ) => Effect.Effect<void, FoundationDbError>;
+  readonly getApproximateSize: () => Effect.Effect<bigint, FoundationDbError>;
+  /**
+   * Starts a watch that becomes active when this transaction commits.
+   * Return the future from the transaction and await it after commit.
+   */
+  readonly watch: (
+    key: Bytes,
+  ) => Effect.Effect<FoundationDbFuture<void>>;
+  /**
+   * Starts a future for this transaction's 10-byte commit versionstamp.
+   * Return the future from the transaction and await it after commit.
+   */
+  readonly getVersionstamp: () => Effect.Effect<
+    FoundationDbFuture<Uint8Array>
+  >;
   readonly getRange: (
     options: RangeOptions,
   ) => Stream.Stream<KeyValue, FoundationDbError>;
@@ -77,6 +134,14 @@ type TransactionRequirements<R> = Exclude<
 >;
 
 export interface FoundationDbShape {
+  readonly withTransactionResult: <A, E, R>(
+    effect: Effect.Effect<A, E, R>,
+    options?: TransactionOptions,
+  ) => Effect.Effect<
+    FoundationDbTransactionResult<A>,
+    E | FoundationDbError,
+    TransactionRequirements<R>
+  >;
   readonly withTransaction: <A, E, R>(
     effect: Effect.Effect<A, E, R>,
     options?: TransactionOptions,
@@ -126,6 +191,11 @@ export interface FoundationDbShape {
     options: RangeOptions,
     transactionOptions?: TransactionOptions,
   ) => Effect.Effect<ReadonlyArray<KeyValue>, FoundationDbError>;
+  /** Watches a key using a dedicated transaction and waits for it to change. */
+  readonly watch: (
+    key: Bytes,
+    options?: TransactionOptions,
+  ) => Effect.Effect<void, FoundationDbError>;
 }
 
 export interface FoundationDbOptions extends FfiOptions {
@@ -175,6 +245,10 @@ interface AttemptTelemetry {
   mutationBytes: number;
 }
 
+interface AttemptResources {
+  readonly cancelPostCommitFutures: Array<Effect.Effect<void>>;
+}
+
 const traceClientOperation = <A, E, R>(
   name: string,
   operation: string,
@@ -197,6 +271,7 @@ const makeTransaction = (
   context: TransactionAttempt,
   attemptTelemetry: AttemptTelemetry,
   transactionTelemetry: TransactionTelemetry,
+  resources: AttemptResources,
 ): FoundationDbTransactionShape => {
   const mutation = (
     effect: Effect.Effect<void, FoundationDbError>,
@@ -209,6 +284,21 @@ const makeTransaction = (
         transactionTelemetry.mutationCount += 1;
         transactionTelemetry.mutationBytes += bytes;
       }));
+
+  const postCommitFuture = <A>(
+    effect: Effect.Effect<A, FoundationDbError>,
+  ): Effect.Effect<FoundationDbFuture<A>> =>
+    Effect.uninterruptible(Effect.map(
+      Effect.forkDetach(effect, { startImmediately: true }),
+      (fiber) => {
+        const cancel = Fiber.interrupt(fiber);
+        resources.cancelPostCommitFutures.push(cancel);
+        return {
+          await: Fiber.join(fiber),
+          cancel,
+        };
+      },
+    ));
 
   return {
     ...context,
@@ -241,9 +331,9 @@ const makeTransaction = (
         driver.set(handle, key, value),
         key.byteLength + value.byteLength,
       ),
-    atomicAdd: (key, value) =>
+    atomicOp: (key, value, mutationType) =>
       mutation(
-        driver.atomicAdd(handle, key, value),
+        driver.atomicOp(handle, key, value, mutationType),
         key.byteLength + value.byteLength,
       ),
     setWithoutWriteConflict: (key, value) =>
@@ -263,7 +353,36 @@ const makeTransaction = (
         begin.byteLength + end.byteLength,
       ),
     addWriteConflictRange: (begin, end) =>
-      driver.addWriteConflictRange(handle, begin, end),
+      driver.addConflictRange(handle, begin, end, ConflictRangeTypes.Write),
+    addReadConflictRange: (begin, end) =>
+      driver.addConflictRange(handle, begin, end, ConflictRangeTypes.Read),
+    addConflictRange: (begin, end, conflictType) =>
+      driver.addConflictRange(handle, begin, end, conflictType),
+    getReadVersion: () =>
+      traceClientOperation(
+        "FoundationDb.Transaction.getReadVersion",
+        "get_read_version",
+        driver.getReadVersion(handle),
+      ),
+    setReadVersion: (version) => driver.setReadVersion(handle, version),
+    getApproximateSize: () =>
+      traceClientOperation(
+        "FoundationDb.Transaction.getApproximateSize",
+        "get_approximate_size",
+        driver.getApproximateSize(handle),
+      ),
+    watch: (key) =>
+      postCommitFuture(traceClientOperation(
+        "FoundationDb.Transaction.watch",
+        "watch",
+        driver.watch(handle, key),
+      )),
+    getVersionstamp: () =>
+      postCommitFuture(traceClientOperation(
+        "FoundationDb.Transaction.getVersionstamp",
+        "get_versionstamp",
+        driver.getVersionstamp(handle),
+      )),
     getRange: (options) =>
       Stream.unwrap(
         Effect.acquireRelease(
@@ -317,6 +436,9 @@ const setOptions = (
         options.maxRetryDelayMs,
       );
     }
+    if (options.reportConflictingKeys === true) {
+      yield* driver.setTransactionOption(handle, "reportConflictingKeys", 1);
+    }
   });
 
 const makeDatabase = (
@@ -324,168 +446,216 @@ const makeDatabase = (
   database: DatabaseHandle,
   transactionDefaults: TransactionOptions = {},
 ): FoundationDbShape => {
-  const withTransaction: FoundationDbShape["withTransaction"] = Effect.fn(
-    "FoundationDb.withTransaction",
-  )(
-    <A, E, R>(
-      effect: Effect.Effect<A, E, R>,
-      options: TransactionOptions = {},
-    ): Effect.Effect<
-      A,
-      E | FoundationDbError,
-      TransactionRequirements<R>
-    > => {
-      const transactionTelemetry: TransactionTelemetry = {
-        attempts: 0,
-        maybeCommitted: false,
-        mutationCount: 0,
-        mutationBytes: 0,
-      };
+  const withTransactionResult: FoundationDbShape["withTransactionResult"] =
+    Effect.fn(
+      "FoundationDb.withTransaction",
+    )(
+      <A, E, R>(
+        effect: Effect.Effect<A, E, R>,
+        options: TransactionOptions = {},
+      ): Effect.Effect<
+        FoundationDbTransactionResult<A>,
+        E | FoundationDbError,
+        TransactionRequirements<R>
+      > => {
+        const transactionTelemetry: TransactionTelemetry = {
+          attempts: 0,
+          maybeCommitted: false,
+          mutationCount: 0,
+          mutationBytes: 0,
+        };
+        const effectiveOptions = {
+          ...transactionDefaults,
+          ...options,
+        };
 
-      return Effect.acquireUseRelease(
-        driver.openTransaction(database),
-        (handle) =>
-          Effect.gen(function* () {
-            yield* setOptions(driver, handle, {
-              ...transactionDefaults,
-              ...options,
-            });
+        return Effect.acquireUseRelease(
+          driver.openTransaction(database),
+          (handle) =>
+            Effect.gen(function* () {
+              yield* setOptions(driver, handle, effectiveOptions);
 
-            const attempt = (
-              attemptNumber: number,
-              maybeCommitted: boolean,
-            ): Effect.Effect<
-              A,
-              E | FoundationDbError,
-              TransactionRequirements<R>
-            > =>
-              Effect.suspend(() => {
-                transactionTelemetry.attempts = attemptNumber;
-                transactionTelemetry.maybeCommitted = maybeCommitted;
-                const attemptTelemetry: AttemptTelemetry = {
-                  mutationCount: 0,
-                  mutationBytes: 0,
-                };
+              const attempt = (
+                attemptNumber: number,
+                maybeCommitted: boolean,
+                conflictingKeyRanges: ReadonlyArray<ConflictRange>,
+              ): Effect.Effect<
+                FoundationDbTransactionResult<A>,
+                E | FoundationDbError,
+                TransactionRequirements<R>
+              > =>
+                Effect.suspend(() => {
+                  transactionTelemetry.attempts = attemptNumber;
+                  transactionTelemetry.maybeCommitted = maybeCommitted;
+                  const attemptTelemetry: AttemptTelemetry = {
+                    mutationCount: 0,
+                    mutationBytes: 0,
+                  };
+                  const resources: AttemptResources = {
+                    cancelPostCommitFutures: [],
+                  };
+                  let commitFailed = false;
 
-                const runAttempt = Effect.scoped(Effect.provideService(
-                  effect,
-                  FoundationDbTransaction,
-                  makeTransaction(
-                    driver,
-                    handle,
-                    {
-                      attempt: attemptNumber,
-                      maybeCommitted,
-                    },
-                    attemptTelemetry,
-                    transactionTelemetry,
-                  ),
-                )).pipe(
-                  Effect.flatMap((value) =>
-                    traceClientOperation(
-                      "FoundationDb.Transaction.commit",
-                      "commit",
-                      driver.commit(handle),
+                  const runAttempt = Effect.scoped(Effect.provideService(
+                    effect,
+                    FoundationDbTransaction,
+                    makeTransaction(
+                      driver,
+                      handle,
                       {
-                        "db.foundationdb.transaction.attempt": attemptNumber,
+                        attempt: attemptNumber,
+                        maybeCommitted,
+                        conflictingKeyRanges,
                       },
-                    ).pipe(Effect.as(value))
-                  ),
-                  Effect.tapCause((cause) => {
-                    const failure = singleFoundationDbFailure(cause);
-                    return failure === undefined
-                      ? Effect.void
-                      : Effect.annotateCurrentSpan({
-                        "error.type": String(failure.code),
-                        "db.foundationdb.error.code": failure.code,
-                        "db.foundationdb.error.retryable": failure.retryable,
-                        "db.foundationdb.error.maybe_committed":
-                          failure.maybeCommitted,
-                      });
-                  }),
-                  Effect.ensuring(Effect.suspend(() =>
-                    Effect.annotateCurrentSpan({
-                      "db.foundationdb.mutation.count":
-                        attemptTelemetry.mutationCount,
-                      "db.foundationdb.mutation.bytes":
-                        attemptTelemetry.mutationBytes,
-                    })
-                  )),
-                  Effect.withSpan(
-                    "FoundationDb.Transaction.attempt",
-                    {
-                      attributes: {
-                        "db.system.name": "foundationdb",
-                        "db.operation.name": "transaction",
-                        "db.foundationdb.transaction.attempt": attemptNumber,
-                        "db.foundationdb.transaction.maybe_committed":
-                          maybeCommitted,
-                      },
-                    },
-                    { captureStackTrace: false },
-                  ),
-                );
-
-                return Effect.matchCauseEffect(runAttempt, {
-                  onFailure: (cause) => {
-                    const failure = singleFoundationDbFailure(cause);
-                    if (failure === undefined) {
-                      return Effect.failCause(cause);
-                    }
-                    const nextMaybeCommitted = maybeCommitted ||
-                      failure.maybeCommitted;
-                    transactionTelemetry.maybeCommitted = nextMaybeCommitted;
-                    return traceClientOperation(
-                      "FoundationDb.Transaction.onError",
-                      "on_error",
-                      driver.onError(handle, failure),
+                      attemptTelemetry,
+                      transactionTelemetry,
+                      resources,
+                    ),
+                  )).pipe(
+                    Effect.flatMap((value) =>
+                      traceClientOperation(
+                        "FoundationDb.Transaction.commit",
+                        "commit",
+                        driver.commit(handle),
+                        {
+                          "db.foundationdb.transaction.attempt": attemptNumber,
+                        },
+                      ).pipe(
+                        Effect.tapError(() =>
+                          Effect.sync(() => {
+                            commitFailed = true;
+                          })
+                        ),
+                        Effect.map((committedVersion) => ({
+                          value,
+                          committedVersion,
+                        })),
+                      )
+                    ),
+                    Effect.tapCause((cause) => {
+                      const failure = singleFoundationDbFailure(cause);
+                      return failure === undefined
+                        ? Effect.void
+                        : Effect.annotateCurrentSpan({
+                          "error.type": String(failure.code),
+                          "db.foundationdb.error.code": failure.code,
+                          "db.foundationdb.error.retryable": failure.retryable,
+                          "db.foundationdb.error.maybe_committed":
+                            failure.maybeCommitted,
+                        });
+                    }),
+                    Effect.ensuring(Effect.suspend(() =>
+                      Effect.annotateCurrentSpan({
+                        "db.foundationdb.mutation.count":
+                          attemptTelemetry.mutationCount,
+                        "db.foundationdb.mutation.bytes":
+                          attemptTelemetry.mutationBytes,
+                      })
+                    )),
+                    Effect.withSpan(
+                      "FoundationDb.Transaction.attempt",
                       {
-                        "db.foundationdb.transaction.attempt": attemptNumber,
-                        "db.foundationdb.retry.error_code": failure.code,
-                        "db.foundationdb.retry.maybe_committed":
-                          nextMaybeCommitted,
+                        attributes: {
+                          "db.system.name": "foundationdb",
+                          "db.operation.name": "transaction",
+                          "db.foundationdb.transaction.attempt": attemptNumber,
+                          "db.foundationdb.transaction.maybe_committed":
+                            maybeCommitted,
+                        },
                       },
-                    ).pipe(
-                      Effect.mapError((error) =>
-                        preserveMaybeCommitted(error, nextMaybeCommitted)
-                      ),
-                      Effect.andThen(
-                        attempt(
+                      { captureStackTrace: false },
+                    ),
+                    Effect.onExit((exit) =>
+                      Exit.isFailure(exit)
+                        ? Effect.forEach(
+                          resources.cancelPostCommitFutures,
+                          (cancel) => cancel,
+                          { discard: true },
+                        )
+                        : Effect.void
+                    ),
+                  );
+
+                  return Effect.matchCauseEffect(runAttempt, {
+                    onFailure: (cause) =>
+                      Effect.gen(function* () {
+                        const failure = singleFoundationDbFailure(cause);
+                        if (failure === undefined) {
+                          return yield* Effect.failCause(cause);
+                        }
+                        const nextMaybeCommitted = maybeCommitted ||
+                          failure.maybeCommitted;
+                        transactionTelemetry.maybeCommitted =
+                          nextMaybeCommitted;
+                        if (
+                          failure.maybeCommitted &&
+                          effectiveOptions.retryOnMaybeCommitted === false
+                        ) {
+                          return yield* Effect.failCause(cause);
+                        }
+                        const nextConflictingKeyRanges = commitFailed &&
+                            effectiveOptions.reportConflictingKeys === true
+                          ? yield* driver.getConflictingKeyRanges(handle)
+                          : [];
+                        yield* traceClientOperation(
+                          "FoundationDb.Transaction.onError",
+                          "on_error",
+                          driver.onError(handle, failure),
+                          {
+                            "db.foundationdb.transaction.attempt":
+                              attemptNumber,
+                            "db.foundationdb.retry.error_code": failure.code,
+                            "db.foundationdb.retry.maybe_committed":
+                              nextMaybeCommitted,
+                          },
+                        ).pipe(
+                          Effect.mapError((error) =>
+                            preserveMaybeCommitted(error, nextMaybeCommitted)
+                          ),
+                        );
+                        return yield* attempt(
                           attemptNumber + 1,
                           nextMaybeCommitted,
-                        ),
-                      ),
-                    );
-                  },
-                  onSuccess: Effect.succeed,
+                          nextConflictingKeyRanges,
+                        );
+                      }),
+                    onSuccess: Effect.succeed,
+                  });
                 });
-              });
 
-            return yield* attempt(1, false);
-          }),
-        (handle) => releaseOrDie(driver.closeTransaction(handle)),
-      ).pipe(
-        Effect.ensuring(Effect.suspend(() =>
-          Effect.annotateCurrentSpan({
-            "db.system.name": "foundationdb",
-            "db.operation.name": "transaction",
-            "db.foundationdb.transaction.attempts":
-              transactionTelemetry.attempts,
-            "db.foundationdb.transaction.retries": Math.max(
-              transactionTelemetry.attempts - 1,
-              0,
-            ),
-            "db.foundationdb.transaction.maybe_committed":
-              transactionTelemetry.maybeCommitted,
-            "db.foundationdb.mutation.count":
-              transactionTelemetry.mutationCount,
-            "db.foundationdb.mutation.bytes":
-              transactionTelemetry.mutationBytes,
-          })
-        )),
-      );
-    },
-  );
+              return yield* attempt(1, false, []);
+            }),
+          (handle) => releaseOrDie(driver.closeTransaction(handle)),
+        ).pipe(
+          Effect.ensuring(Effect.suspend(() =>
+            Effect.annotateCurrentSpan({
+              "db.system.name": "foundationdb",
+              "db.operation.name": "transaction",
+              "db.foundationdb.transaction.attempts":
+                transactionTelemetry.attempts,
+              "db.foundationdb.transaction.retries": Math.max(
+                transactionTelemetry.attempts - 1,
+                0,
+              ),
+              "db.foundationdb.transaction.maybe_committed":
+                transactionTelemetry.maybeCommitted,
+              "db.foundationdb.mutation.count":
+                transactionTelemetry.mutationCount,
+              "db.foundationdb.mutation.bytes":
+                transactionTelemetry.mutationBytes,
+            })
+          )),
+        );
+      },
+    );
+
+  const withTransaction: FoundationDbShape["withTransaction"] = (
+    effect,
+    options,
+  ) =>
+    withTransactionResult(effect, options).pipe(
+      Effect.map((result) => result.value),
+    );
 
   const get: FoundationDbShape["get"] = Effect.fnUntraced(function* (
     key,
@@ -566,7 +736,32 @@ const makeDatabase = (
       transactionOptions,
     );
 
-  return { withTransaction, get, getMany, set, clear, clearRange, getRange };
+  const watch: FoundationDbShape["watch"] = (key, options) =>
+    withTransaction(
+      Effect.flatMap(FoundationDbTransaction, (transaction) =>
+        transaction.watch(key)),
+      options,
+    ).pipe(
+      Effect.flatMap((future) =>
+        future.await.pipe(
+          Effect.onInterrupt(() =>
+            future.cancel
+          ),
+        )
+      ),
+    );
+
+  return {
+    withTransactionResult,
+    withTransaction,
+    get,
+    getMany,
+    set,
+    clear,
+    clearRange,
+    getRange,
+    watch,
+  };
 };
 
 export class FoundationDb

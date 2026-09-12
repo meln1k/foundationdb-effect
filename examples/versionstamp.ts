@@ -3,12 +3,14 @@ import {
   FoundationDb,
   FoundationDbTransaction,
   keyRange,
+  MutationType,
   pack,
+  packWithVersionstamp,
   Subspace,
   unpack,
   Versionstamp,
 } from "../mod.ts";
-import { assert, runMain } from "./_shared.ts";
+import { assert, assertBytesEqual, runMain } from "./_shared.ts";
 
 const VersionstampTuple = Schema.Tuple([
   Schema.String,
@@ -16,50 +18,55 @@ const VersionstampTuple = Schema.Tuple([
 ]);
 const StringTuple = Schema.Tuple([Schema.String]);
 
-// Tuple versionstamps are complete, but SetVersionstampedKey and
-// SetVersionstampedValue mutations are not yet exposed by the native bridge.
-// This runnable analogue uses complete versionstamps to demonstrate their
-// canonical tuple ordering and a versionstamped-key reference.
 const program = Effect.gen(function* () {
   const database = yield* FoundationDb;
   const root = yield* Subspace.fromTuple(["versionstamp_example"]);
   const [begin, end] = yield* root.range();
   yield* database.clearRange(begin, end);
 
-  const firstCommit = new Uint8Array(10);
-  firstCommit[9] = 1;
-  const secondCommit = new Uint8Array(10);
-  secondCommit[9] = 2;
-  const first1 = yield* Versionstamp.complete(firstCommit, 1);
-  const first2 = yield* Versionstamp.complete(firstCommit, 2);
-  const second1 = yield* Versionstamp.complete(secondCommit, 1);
-  const second2 = yield* Versionstamp.complete(secondCommit, 2);
+  const first1 = yield* Versionstamp.incomplete(1);
+  const first2 = yield* Versionstamp.incomplete(2);
 
-  yield* database.withTransaction(
+  const firstVersionFuture = yield* database.withTransaction(
     Effect.gen(function* () {
       const transaction = yield* FoundationDbTransaction;
-      yield* transaction.set(
-        yield* root.pack(["prefix", first1]),
-        yield* pack(["value_2_1"]),
+      yield* transaction.atomicOp(
+        yield* root.packWithVersionstamp(["prefix", first1]),
+        yield* pack(["first_1"]),
+        MutationType.SetVersionstampedKey,
       );
-      yield* transaction.set(
-        yield* root.pack(["prefix", first2]),
-        yield* pack(["value_2_2"]),
+      yield* transaction.atomicOp(
+        yield* root.packWithVersionstamp(["prefix", first2]),
+        yield* pack(["first_2"]),
+        MutationType.SetVersionstampedKey,
       );
+      return yield* transaction.getVersionstamp();
     }),
   );
-  yield* database.withTransaction(
+  const firstVersion = yield* firstVersionFuture.await.pipe(
+    Effect.onInterrupt(() => firstVersionFuture.cancel),
+  );
+
+  const second1 = yield* Versionstamp.incomplete(1);
+  const second2 = yield* Versionstamp.incomplete(2);
+  const secondVersionFuture = yield* database.withTransaction(
     Effect.gen(function* () {
       const transaction = yield* FoundationDbTransaction;
-      yield* transaction.set(
-        yield* root.pack(["prefix", second1]),
-        yield* pack(["value_1_2"]),
+      yield* transaction.atomicOp(
+        yield* root.packWithVersionstamp(["prefix", second1]),
+        yield* pack(["second_1"]),
+        MutationType.SetVersionstampedKey,
       );
-      yield* transaction.set(
-        yield* root.pack(["prefix", second2]),
-        yield* pack(["value_1_1"]),
+      yield* transaction.atomicOp(
+        yield* root.packWithVersionstamp(["prefix", second2]),
+        yield* pack(["second_2"]),
+        MutationType.SetVersionstampedKey,
       );
+      return yield* transaction.getVersionstamp();
     }),
+  );
+  const secondVersion = yield* secondVersionFuture.await.pipe(
+    Effect.onInterrupt(() => secondVersionFuture.cancel),
   );
 
   const values = yield* database.withTransaction(
@@ -86,20 +93,34 @@ const program = Effect.gen(function* () {
     }),
   );
   assert(
-    values.join(",") === "value_2_1,value_2_2,value_1_2,value_1_1",
+    values.join(",") === "first_1,first_2,second_1,second_2",
     `unexpected versionstamp order: ${values}`,
   );
+  assert(
+    firstVersion.some((byte, index) => byte !== secondVersion[index]),
+    "separate commits must have separate transaction versions",
+  );
 
-  const referencedStamp = yield* Versionstamp.complete(secondCommit, 3);
-  const referencedKeyTuple = ["data", referencedStamp] as const;
-  const referencedKey = yield* root.pack(referencedKeyTuple);
+  const referencedStamp = yield* Versionstamp.incomplete(3);
   const indexKey = yield* root.pack(["index"]);
-  yield* database.withTransaction(
+  const referencedVersionFuture = yield* database.withTransaction(
     Effect.gen(function* () {
       const transaction = yield* FoundationDbTransaction;
-      yield* transaction.set(referencedKey, yield* pack(["some value"]));
-      yield* transaction.set(indexKey, yield* pack(referencedKeyTuple));
+      yield* transaction.atomicOp(
+        yield* root.packWithVersionstamp(["data", referencedStamp]),
+        yield* pack(["some value"]),
+        MutationType.SetVersionstampedKey,
+      );
+      yield* transaction.atomicOp(
+        indexKey,
+        yield* packWithVersionstamp(["data", referencedStamp]),
+        MutationType.SetVersionstampedValue,
+      );
+      return yield* transaction.getVersionstamp();
     }),
+  );
+  const referencedVersion = yield* referencedVersionFuture.await.pipe(
+    Effect.onInterrupt(() => referencedVersionFuture.cancel),
   );
   const encodedReference = yield* database.get(indexKey);
   assert(encodedReference !== undefined, "versionstamp index was not found");
@@ -107,6 +128,7 @@ const program = Effect.gen(function* () {
     encodedReference,
     VersionstampTuple,
   );
+  assertBytesEqual(reference[1].transactionVersion, referencedVersion);
   const stored = yield* database.get(yield* root.pack(reference));
   assert(stored !== undefined, "versionstamped value was not found");
   const [storedValue] = yield* unpack(stored, StringTuple);

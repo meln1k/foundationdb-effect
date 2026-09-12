@@ -1,6 +1,6 @@
-import { Effect, Layer } from "effect";
+import { Effect, Layer, Scope } from "effect";
 import { FoundationDbError } from "../errors.ts";
-import { KeyValue, StreamingMode } from "../model.ts";
+import { ConflictRange, KeyValue, StreamingMode } from "../model.ts";
 import type { Bytes } from "../model.ts";
 import { NativeDriver } from "./native.ts";
 import type { NativeDriverShape, RangeBatch } from "./native.ts";
@@ -54,8 +54,8 @@ const symbols = {
     parameters: ["u64", "buffer", "usize", "buffer", "usize"],
     result: "i32",
   },
-  fdb_rs_transaction_atomic_add: {
-    parameters: ["u64", "buffer", "usize", "buffer", "usize"],
+  fdb_rs_transaction_atomic_op: {
+    parameters: ["u64", "buffer", "usize", "buffer", "usize", "i32"],
     result: "i32",
   },
   fdb_rs_transaction_set_without_write_conflict: {
@@ -74,9 +74,33 @@ const symbols = {
     parameters: ["u64", "buffer", "usize", "buffer", "usize"],
     result: "i32",
   },
-  fdb_rs_transaction_add_write_conflict_range: {
-    parameters: ["u64", "buffer", "usize", "buffer", "usize"],
+  fdb_rs_transaction_add_conflict_range: {
+    parameters: ["u64", "buffer", "usize", "buffer", "usize", "u8"],
     result: "i32",
+  },
+  fdb_rs_transaction_get_read_version: {
+    parameters: ["u64", "pointer", "u64"],
+    result: "i32",
+  },
+  fdb_rs_transaction_set_read_version: {
+    parameters: ["u64", "i64"],
+    result: "i32",
+  },
+  fdb_rs_transaction_get_approximate_size: {
+    parameters: ["u64", "pointer", "u64"],
+    result: "i32",
+  },
+  fdb_rs_transaction_watch: {
+    parameters: ["u64", "buffer", "usize", "pointer", "u64"],
+    result: "i32",
+  },
+  fdb_rs_transaction_get_versionstamp: {
+    parameters: ["u64", "pointer", "u64"],
+    result: "i32",
+  },
+  fdb_rs_transaction_get_conflicting_key_ranges: {
+    parameters: ["u64"],
+    result: "pointer",
   },
   fdb_rs_range_open: {
     parameters: [
@@ -236,9 +260,56 @@ const decodeKeyValues = (bytes: Uint8Array): ReadonlyArray<KeyValue> => {
   return values;
 };
 
+const decodeI64 = (bytes: Uint8Array): bigint => {
+  if (bytes.byteLength !== 8) {
+    throw new Error("native 64-bit integer has an invalid length");
+  }
+  return new DataView(
+    bytes.buffer,
+    bytes.byteOffset,
+    bytes.byteLength,
+  ).getBigInt64(0, true);
+};
+
+const decodeConflictRanges = (
+  bytes: Uint8Array,
+): ReadonlyArray<ConflictRange> => {
+  if (bytes.byteLength < 4) {
+    throw new Error("native conflict range response is truncated");
+  }
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const count = view.getUint32(0, true);
+  const ranges: Array<ConflictRange> = [];
+  let offset = 4;
+  for (let index = 0; index < count; index++) {
+    if (offset + 8 > bytes.byteLength) {
+      throw new Error("native conflict range response is truncated");
+    }
+    const beginLength = view.getUint32(offset, true);
+    const endLength = view.getUint32(offset + 4, true);
+    offset += 8;
+    if (offset + beginLength + endLength > bytes.byteLength) {
+      throw new Error("native conflict range response is truncated");
+    }
+    const begin = bytes.slice(offset, offset + beginLength);
+    offset += beginLength;
+    const end = bytes.slice(offset, offset + endLength);
+    offset += endLength;
+    ranges.push(new ConflictRange({ begin, end }));
+  }
+  if (offset !== bytes.byteLength) {
+    throw new Error("native conflict range response has trailing bytes");
+  }
+  return ranges;
+};
+
 const makeDriver = (
   library: Library,
-): { readonly driver: NativeDriverShape; readonly close: () => void } => {
+): {
+  readonly driver: NativeDriverShape;
+  readonly drain: () => Promise<void>;
+  readonly close: () => void;
+} => {
   const error = (operation: string, code: number): FoundationDbError => {
     const pointer = library.symbols.fdb_rs_error_message(code);
     let message = `FoundationDB error ${code}`;
@@ -330,6 +401,7 @@ const makeDriver = (
     readonly complete: () => void;
   }
 
+  let closing = false;
   const pending = new Map<bigint, PendingOperation>();
   const completionCallback = Deno.UnsafeCallback.threadSafe(
     { parameters: ["u64"], result: "void" } as const,
@@ -347,6 +419,12 @@ const makeDriver = (
     project: (result: ReturnType<typeof readResult>) => A,
   ): Effect.Effect<A, FoundationDbError> =>
     Effect.callback((resume) => {
+      if (closing) {
+        resume(
+          Effect.fail(fallbackError(operation, "native driver is closed")),
+        );
+        return Effect.void;
+      }
       const requestId = nextRequestId++;
       let resolveDone!: () => void;
       const done = new Promise<void>((resolve) => {
@@ -462,7 +540,13 @@ const makeDriver = (
         () => library.symbols.fdb_rs_transaction_close(handle),
       ),
     setTransactionOption: (handle, option, value) => {
-      const code = option === "timeout" ? 0 : option === "retryLimit" ? 1 : 2;
+      const code = option === "timeout"
+        ? 0
+        : option === "retryLimit"
+        ? 1
+        : option === "maxRetryDelay"
+        ? 2
+        : 3;
       return syncCode(
         `Transaction.${option}`,
         () =>
@@ -532,16 +616,17 @@ const makeDriver = (
             BigInt(value.length),
           ),
       ),
-    atomicAdd: (handle, key, value) =>
+    atomicOp: (handle, key, value, mutationType) =>
       syncCode(
-        "Transaction.atomicAdd",
+        "Transaction.atomicOp",
         () =>
-          library.symbols.fdb_rs_transaction_atomic_add(
+          library.symbols.fdb_rs_transaction_atomic_op(
             handle,
             asFfiBuffer(key),
             BigInt(key.length),
             asFfiBuffer(value),
             BigInt(value.length),
+            mutationType,
           ),
       ),
     setWithoutWriteConflict: (handle, key, value) =>
@@ -590,17 +675,76 @@ const makeDriver = (
             BigInt(end.length),
           ),
       ),
-    addWriteConflictRange: (handle, begin, end) =>
+    addConflictRange: (handle, begin, end, conflictType) =>
       syncCode(
-        "Transaction.addWriteConflictRange",
+        "Transaction.addConflictRange",
         () =>
-          library.symbols.fdb_rs_transaction_add_write_conflict_range(
+          library.symbols.fdb_rs_transaction_add_conflict_range(
             handle,
             asFfiBuffer(begin),
             BigInt(begin.length),
             asFfiBuffer(end),
             BigInt(end.length),
+            conflictType,
           ),
+      ),
+    getReadVersion: (handle) =>
+      asyncResult(
+        "Transaction.getReadVersion",
+        (callback, requestId) =>
+          library.symbols.fdb_rs_transaction_get_read_version(
+            handle,
+            callback,
+            requestId,
+          ),
+        ({ data }) => decodeI64(data),
+      ),
+    setReadVersion: (handle, version) =>
+      syncCode(
+        "Transaction.setReadVersion",
+        () =>
+          library.symbols.fdb_rs_transaction_set_read_version(handle, version),
+      ),
+    getApproximateSize: (handle) =>
+      asyncResult(
+        "Transaction.getApproximateSize",
+        (callback, requestId) =>
+          library.symbols.fdb_rs_transaction_get_approximate_size(
+            handle,
+            callback,
+            requestId,
+          ),
+        ({ data }) => decodeI64(data),
+      ),
+    watch: (handle, key) =>
+      asyncCode(
+        "Transaction.watch",
+        (callback, requestId) =>
+          library.symbols.fdb_rs_transaction_watch(
+            handle,
+            asFfiBuffer(key),
+            BigInt(key.length),
+            callback,
+            requestId,
+          ),
+      ),
+    getVersionstamp: (handle) =>
+      asyncResult(
+        "Transaction.getVersionstamp",
+        (callback, requestId) =>
+          library.symbols.fdb_rs_transaction_get_versionstamp(
+            handle,
+            callback,
+            requestId,
+          ),
+        ({ data }) => data,
+      ),
+    getConflictingKeyRanges: (handle) =>
+      syncResult(
+        "Transaction.getConflictingKeyRanges",
+        () =>
+          library.symbols.fdb_rs_transaction_get_conflicting_key_ranges(handle),
+        ({ data }) => decodeConflictRanges(data),
       ),
     openRange: (handle, options) =>
       syncResult(
@@ -640,7 +784,7 @@ const makeDriver = (
         () => library.symbols.fdb_rs_range_close(handle),
       ),
     commit: (handle) =>
-      asyncCode(
+      asyncResult(
         "Transaction.commit",
         (callback, requestId) =>
           library.symbols.fdb_rs_transaction_commit(
@@ -648,6 +792,7 @@ const makeDriver = (
             callback,
             requestId,
           ),
+        ({ data }) => decodeI64(data),
       ),
     onError: (handle, failure) =>
       asyncCode(
@@ -662,8 +807,36 @@ const makeDriver = (
       ),
   };
 
-  return { driver, close: () => completionCallback.close() };
+  const drain = async (): Promise<void> => {
+    closing = true;
+    const active = Array.from(pending, ([requestId, operation]) => ({
+      requestId,
+      operation,
+    }));
+    for (const { requestId, operation } of active) {
+      if (!operation.settled) {
+        library.symbols.fdb_rs_async_cancel(requestId);
+      }
+    }
+    await Promise.all(active.map(({ operation }) => operation.done));
+  };
+
+  return { driver, drain, close: () => completionCallback.close() };
 };
+
+const acquireDriverLifecycle = <A, E, R>(
+  initialize: Effect.Effect<void, E, R>,
+  shutdown: Effect.Effect<void>,
+  open: Effect.Effect<A, E, R>,
+  drain: (resource: A) => Effect.Effect<void>,
+  close: (resource: A) => Effect.Effect<void>,
+): Effect.Effect<A, E, R | Scope.Scope> =>
+  Effect.gen(function* () {
+    const resource = yield* Effect.acquireRelease(open, close);
+    yield* Effect.acquireRelease(initialize, () => shutdown);
+    yield* Effect.acquireRelease(Effect.void, () => drain(resource));
+    return resource;
+  });
 
 export const ffiLayer = (
   options: FfiOptions,
@@ -678,19 +851,17 @@ export const ffiLayer = (
         }),
         (library) => Effect.sync(() => library.close()),
       );
-      const driverResource = yield* Effect.acquireRelease(
+      const driverResource = yield* acquireDriverLifecycle(
+        syncInit(library, options.apiVersion ?? 740),
+        asyncCodeForLibrary("FoundationDb.shutdown", () =>
+          library.symbols.fdb_rs_shutdown()).pipe(Effect.orDie),
         Effect.try({
-          try: () => makeDriver(library),
+          try: () =>
+            makeDriver(library),
           catch: (cause) => fallbackError("NativeCallback.open", cause),
         }),
+        (resource) => Effect.promise(resource.drain),
         (resource) => Effect.sync(resource.close),
-      );
-      yield* Effect.acquireRelease(
-        syncInit(library, options.apiVersion ?? 740),
-        () =>
-          asyncCodeForLibrary("FoundationDb.shutdown", () =>
-            library.symbols.fdb_rs_shutdown())
-            .pipe(Effect.orDie),
       );
       return driverResource.driver;
     }),
@@ -735,6 +906,9 @@ const asyncCodeForLibrary = (
   );
 
 export const internal = {
+  acquireDriverLifecycle,
+  decodeConflictRanges,
+  decodeI64,
   decodeKeyValues,
   decodeOptionalValues,
   encodeKeys,

@@ -29,6 +29,37 @@ export class KeyValue extends Schema.Class<KeyValue>("KeyValue")({
   value: Schema.Uint8Array,
 }) {}
 
+export class ConflictRange
+  extends Schema.Class<ConflictRange>("ConflictRange")({
+    begin: Schema.Uint8Array,
+    end: Schema.Uint8Array,
+  }) {}
+
+export const ConflictRangeType = {
+  Read: 0,
+  Write: 1,
+} as const;
+
+export type ConflictRangeType =
+  typeof ConflictRangeType[keyof typeof ConflictRangeType];
+
+export const MutationType = {
+  Add: 2,
+  BitAnd: 6,
+  BitOr: 7,
+  BitXor: 8,
+  AppendIfFits: 9,
+  Max: 12,
+  Min: 13,
+  SetVersionstampedKey: 14,
+  SetVersionstampedValue: 15,
+  ByteMin: 16,
+  ByteMax: 17,
+  CompareAndClear: 20,
+} as const;
+
+export type MutationType = typeof MutationType[keyof typeof MutationType];
+
 export const StreamingMode = {
   WantAll: -2,
   Iterator: -1,
@@ -55,11 +86,16 @@ export interface TransactionOptions {
   readonly timeoutMs?: number;
   readonly retryLimit?: number;
   readonly maxRetryDelayMs?: number;
+  readonly reportConflictingKeys?: boolean;
+  /** Whether to retry when FoundationDB cannot determine if commit succeeded. Defaults to true. */
+  readonly retryOnMaybeCommitted?: boolean;
 }
 
 export interface TransactionAttempt {
   readonly attempt: number;
   readonly maybeCommitted: boolean;
+  /** Key ranges reported for the preceding failed commit. */
+  readonly conflictingKeyRanges: ReadonlyArray<ConflictRange>;
 }
 
 export const keyRange = (

@@ -1,7 +1,9 @@
 export { FoundationDb, FoundationDbTransaction } from "./src/FoundationDb.ts";
 export type {
+  FoundationDbFuture,
   FoundationDbOptions,
   FoundationDbShape,
+  FoundationDbTransactionResult,
   FoundationDbTransactionShape,
 } from "./src/FoundationDb.ts";
 export { FoundationDbError, isFoundationDbError } from "./src/errors.ts";
@@ -25,7 +27,28 @@ export {
   makePersistedQueueStore,
 } from "./src/persisted-queue/mod.ts";
 export type { PersistedQueueStoreOptions } from "./src/persisted-queue/mod.ts";
-export { keyRange, KeySelector, KeyValue, StreamingMode } from "./src/model.ts";
+export {
+  layerBackingPersistence,
+  layerFoundationDB,
+  layerRateLimiterStore,
+  makeBackingPersistence,
+  makeKeyValueStore,
+  makeRateLimiterStore,
+} from "./src/persistence/mod.ts";
+export type {
+  BackingPersistenceOptions,
+  KeyValueStoreOptions,
+  RateLimiterStoreOptions,
+} from "./src/persistence/mod.ts";
+export {
+  ConflictRange,
+  ConflictRangeType,
+  keyRange,
+  KeySelector,
+  KeyValue,
+  MutationType,
+  StreamingMode,
+} from "./src/model.ts";
 export type {
   Bytes,
   RangeOptions,
