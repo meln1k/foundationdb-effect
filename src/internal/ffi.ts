@@ -110,9 +110,8 @@ const symbols = {
     parameters: ["u64", "i32", "pointer", "u64"],
     result: "i32",
   },
-  fdb_rs_async_poll: { parameters: ["u64"], result: "pointer" },
+  fdb_rs_async_take: { parameters: ["u64"], result: "pointer" },
   fdb_rs_async_cancel: { parameters: ["u64"], result: "i32" },
-  fdb_rs_async_ack: { parameters: ["u64"], result: "i32" },
   fdb_rs_result_code: { parameters: ["pointer"], result: "i32" },
   fdb_rs_result_flags: { parameters: ["pointer"], result: "u32" },
   fdb_rs_result_handle: { parameters: ["pointer"], result: "u64" },
@@ -377,7 +376,7 @@ const makeDriver = (
         settled: false,
         done,
         complete: () => {
-          const pointer = library.symbols.fdb_rs_async_poll(requestId);
+          const pointer = library.symbols.fdb_rs_async_take(requestId);
           if (pointer === null) {
             return;
           }
@@ -390,8 +389,6 @@ const makeDriver = (
                 ? cause
                 : fallbackError(operation, cause),
             );
-          } finally {
-            library.symbols.fdb_rs_async_ack(requestId);
           }
           finish(pendingOperation, effect);
         },

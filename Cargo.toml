@@ -10,8 +10,10 @@ publish = false
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+async-channel = "2.5.0"
+async-executor = "1.14.0"
 foundationdb = { version = "=0.11.0", default-features = false, features = ["embedded-fdb-include", "fdb-7_4"] }
-futures = "0.3.32"
+futures-lite = "2.6.1"
 parking_lot = "0.12.5"
 
 [profile.release]

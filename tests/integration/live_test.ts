@@ -244,7 +244,7 @@ Deno.test({
           Scope.make(),
           (scope, exit) => Scope.close(scope, exit),
         );
-        yield* Layer.buildWithScope(
+        const firstContext = yield* Layer.buildWithScope(
           FoundationDb.layer(foundationDbOptions),
           firstScope,
         );
@@ -252,8 +252,10 @@ Deno.test({
           FoundationDb.layer(foundationDbOptions),
           secondScope,
         );
+        const firstDatabase = Context.get(firstContext, FoundationDb);
         const secondDatabase = Context.get(secondContext, FoundationDb);
 
+        assertEquals(yield* firstDatabase.get(firstKey), undefined);
         yield* Scope.close(firstScope, Exit.succeed(undefined));
 
         const foundationDbLayer = Layer.succeed(

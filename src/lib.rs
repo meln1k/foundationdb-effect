@@ -1,22 +1,24 @@
 //! Native Deno FFI bridge for `foundationdb-rs`.
 
+use async_channel::Sender;
+use async_executor::Executor;
 use foundationdb::api::NetworkAutoStop;
 use foundationdb::options::{ConflictRangeType, MutationType, StreamingMode, TransactionOption};
 use foundationdb::{
     Database, FdbError, KeySelector, RangeOption, Transaction, TransactionCommitError,
 };
-use futures::Future;
-use futures::task::{ArcWake, waker_ref};
-use parking_lot::Mutex;
+use futures_lite::future::{self, FutureExt};
+use parking_lot::{Condvar, Mutex};
 use std::collections::HashMap;
 use std::ffi::{CString, c_char};
+use std::future::Future;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::pin::Pin;
 use std::slice;
 use std::str;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock};
-use std::task::{Context, Poll};
+use std::sync::{Arc, LazyLock, mpsc};
+use std::thread::{self, JoinHandle};
 
 const BRIDGE_NOT_RUNNING: i32 = 90_000;
 const INVALID_HANDLE: i32 = 90_001;
@@ -25,12 +27,14 @@ const INVALID_ARGUMENT: i32 = 90_003;
 const INVALID_TRANSACTION_STATE: i32 = 90_004;
 const BRIDGE_PANIC: i32 = 90_005;
 const ASYNC_CANCELLED: i32 = 90_006;
+const EXECUTOR_FAILURE: i32 = 90_008;
 
 const RESULT_PRESENT: u32 = 1;
 const RESULT_MORE: u32 = 2;
 
 static LIFECYCLE: LazyLock<Mutex<Lifecycle>> =
     LazyLock::new(|| Mutex::new(Lifecycle::Uninitialized));
+static OWNER_RELEASE: Mutex<()> = Mutex::new(());
 static ASYNC_TASKS: LazyLock<Mutex<HashMap<u64, Arc<AsyncTask>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
@@ -38,17 +42,28 @@ type CompletionCallback = unsafe extern "C" fn(u64);
 type AsyncFuture = Pin<Box<dyn Future<Output = Result<FfiResult, i32>> + Send + 'static>>;
 
 struct AsyncTask {
-    request_id: u64,
-    callback: CompletionCallback,
-    state: Mutex<AsyncTaskState>,
+    cancel: Sender<()>,
+    completion: Mutex<Option<FfiResult>>,
 }
 
-struct AsyncTaskState {
-    future: Option<AsyncFuture>,
-    polling: bool,
-    cancelled: bool,
-    completion: Option<FfiResult>,
-    delivered: bool,
+struct TaskActivity {
+    state: Mutex<TaskActivityState>,
+    idle: Condvar,
+}
+
+struct TaskActivityState {
+    accepting: bool,
+    active: usize,
+}
+
+struct ActiveTask {
+    activity: Arc<TaskActivity>,
+}
+
+struct OwnedExecutor {
+    executor: Arc<Executor<'static>>,
+    shutdown: Sender<()>,
+    thread: Mutex<Option<JoinHandle<()>>>,
 }
 
 enum Lifecycle {
@@ -64,6 +79,8 @@ enum Lifecycle {
 struct Runtime {
     api_version: i32,
     next_handle: AtomicU64,
+    executor: OwnedExecutor,
+    activity: Arc<TaskActivity>,
     network: Mutex<Option<NetworkAutoStop>>,
     databases: Mutex<HashMap<u64, Arc<Database>>>,
     transactions: Mutex<HashMap<u64, Arc<Mutex<Option<TransactionState>>>>>,
@@ -120,145 +137,165 @@ impl FfiResult {
     }
 }
 
-impl AsyncTask {
-    fn new(request_id: u64, callback: CompletionCallback, future: AsyncFuture) -> Self {
+impl TaskActivity {
+    fn new() -> Self {
         Self {
-            request_id,
-            callback,
-            state: Mutex::new(AsyncTaskState {
-                future: Some(future),
-                polling: false,
-                cancelled: false,
-                completion: None,
-                delivered: false,
+            state: Mutex::new(TaskActivityState {
+                accepting: true,
+                active: 0,
             }),
+            idle: Condvar::new(),
         }
     }
 
-    fn poll(self: &Arc<Self>, deliver: bool) -> Option<FfiResult> {
-        let mut future = {
-            let mut state = self.state.lock();
-            if state.delivered {
-                return None;
-            }
-            if deliver {
-                if let Some(result) = state.completion.take() {
-                    state.delivered = true;
-                    return Some(result);
-                }
-            }
-            if state.polling || state.completion.is_some() {
-                return None;
-            }
-            let future = state.future.take()?;
-            state.polling = true;
-            future
-        };
-
-        let waker = waker_ref(self);
-        let mut context = Context::from_waker(&waker);
-        let polled = catch_unwind(AssertUnwindSafe(|| future.as_mut().poll(&mut context)));
-
+    fn register(
+        self: &Arc<Self>,
+        request_id: u64,
+        task: Arc<AsyncTask>,
+    ) -> Result<ActiveTask, i32> {
         let mut state = self.state.lock();
-        state.polling = false;
-        let completed = if state.cancelled {
-            Some(FfiResult::error(ASYNC_CANCELLED))
-        } else {
-            match polled {
-                Ok(Poll::Ready(result)) => Some(result.unwrap_or_else(FfiResult::error)),
-                Err(_) => Some(FfiResult::error(BRIDGE_PANIC)),
-                Ok(Poll::Pending) => {
-                    state.future = Some(future);
-                    None
-                }
-            }
-        };
-
-        let mut result = None;
-        let notify = if let Some(completed) = completed {
-            if deliver {
-                state.delivered = true;
-                result = Some(completed);
-                false
-            } else {
-                state.completion = Some(completed);
-                true
-            }
-        } else {
-            false
-        };
-        drop(state);
-
-        if notify {
-            self.notify();
+        if !state.accepting {
+            return Err(BRIDGE_NOT_RUNNING);
         }
-        result
+        let mut tasks = ASYNC_TASKS.lock();
+        if tasks.contains_key(&request_id) {
+            return Err(INVALID_ARGUMENT);
+        }
+        tasks.insert(request_id, task);
+        state.active += 1;
+        Ok(ActiveTask {
+            activity: Arc::clone(self),
+        })
     }
 
-    fn cancel(self: &Arc<Self>) {
-        let future = {
-            let mut state = self.state.lock();
-            if state.delivered || state.completion.is_some() || state.cancelled {
-                return;
-            }
-            state.cancelled = true;
-            if state.polling {
-                return;
-            }
-            let future = state.future.take();
-            state.completion = Some(FfiResult::error(ASYNC_CANCELLED));
-            future
-        };
-        drop(future);
-        self.notify();
+    fn stop_accepting(&self) {
+        self.state.lock().accepting = false;
     }
 
-    fn notify(&self) {
-        unsafe { (self.callback)(self.request_id) };
+    fn wait_idle(&self) {
+        let mut state = self.state.lock();
+        while state.active != 0 {
+            self.idle.wait(&mut state);
+        }
     }
 }
 
-impl ArcWake for AsyncTask {
-    fn wake_by_ref(arc_self: &Arc<Self>) {
-        arc_self.notify();
+impl Drop for ActiveTask {
+    fn drop(&mut self) {
+        let mut state = self.activity.state.lock();
+        state.active -= 1;
+        if state.active == 0 {
+            self.activity.idle.notify_all();
+        }
+    }
+}
+
+impl OwnedExecutor {
+    fn new() -> Result<Self, i32> {
+        let executor = Arc::new(Executor::new());
+        let (shutdown, receiver) = async_channel::bounded(1);
+        let runner = Arc::clone(&executor);
+        let thread = thread::Builder::new()
+            .name("foundationdb-async".to_owned())
+            .spawn(move || {
+                future::block_on(runner.run(async move {
+                    let _ = receiver.recv().await;
+                }));
+            })
+            .map_err(|_| EXECUTOR_FAILURE)?;
+        Ok(Self {
+            executor,
+            shutdown,
+            thread: Mutex::new(Some(thread)),
+        })
+    }
+
+    fn spawn(&self, future: impl Future<Output = ()> + Send + 'static) {
+        self.executor.spawn(future).detach();
+    }
+
+    fn barrier_receiver(&self) -> mpsc::Receiver<()> {
+        let (completed, receiver) = mpsc::channel();
+        self.spawn(async move {
+            let _ = completed.send(());
+        });
+        receiver
+    }
+
+    fn barrier(&self) -> Result<(), i32> {
+        self.barrier_receiver().recv().map_err(|_| EXECUTOR_FAILURE)
+    }
+
+    fn shutdown(&self) -> Result<(), i32> {
+        self.shutdown.close();
+        if let Some(thread) = self.thread.lock().take() {
+            thread.join().map_err(|_| EXECUTOR_FAILURE)?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for OwnedExecutor {
+    fn drop(&mut self) {
+        self.shutdown.close();
+        if let Some(thread) = self.thread.get_mut().take() {
+            let _ = thread.join();
+        }
     }
 }
 
 fn start_async(
+    executor: &OwnedExecutor,
+    activity: &Arc<TaskActivity>,
     request_id: u64,
     callback: Option<CompletionCallback>,
     future: AsyncFuture,
 ) -> Result<(), i32> {
     let callback = callback.ok_or(INVALID_ARGUMENT)?;
-    let task = Arc::new(AsyncTask::new(request_id, callback, future));
-    {
-        let mut tasks = ASYNC_TASKS.lock();
-        if tasks.contains_key(&request_id) {
-            return Err(INVALID_ARGUMENT);
-        }
-        tasks.insert(request_id, Arc::clone(&task));
-    }
-    let _ = task.poll(false);
+    let (cancel, cancelled) = async_channel::bounded(1);
+    let task = Arc::new(AsyncTask {
+        cancel,
+        completion: Mutex::new(None),
+    });
+    let active = activity.register(request_id, Arc::clone(&task))?;
+    executor.spawn(async move {
+        let operation = async move {
+            match AssertUnwindSafe(future).catch_unwind().await {
+                Ok(result) => result.unwrap_or_else(FfiResult::error),
+                Err(_) => FfiResult::error(BRIDGE_PANIC),
+            }
+        };
+        let cancellation = async move {
+            let _ = cancelled.recv().await;
+            FfiResult::error(ASYNC_CANCELLED)
+        };
+        let completion = operation.or(cancellation).await;
+        *task.completion.lock() = Some(completion);
+        unsafe { callback(request_id) };
+        drop(active);
+    });
     Ok(())
 }
 
 fn cancel_all_async() {
     let tasks = ASYNC_TASKS.lock().values().cloned().collect::<Vec<_>>();
     for task in tasks {
-        task.cancel();
+        task.cancel.close();
     }
 }
 
 impl Runtime {
-    fn new(api_version: i32, network: NetworkAutoStop) -> Self {
-        Self {
+    fn new(api_version: i32, network: NetworkAutoStop) -> Result<Self, i32> {
+        Ok(Self {
             api_version,
             next_handle: AtomicU64::new(1),
+            executor: OwnedExecutor::new()?,
+            activity: Arc::new(TaskActivity::new()),
             network: Mutex::new(Some(network)),
             databases: Mutex::new(HashMap::new()),
             transactions: Mutex::new(HashMap::new()),
             ranges: Mutex::new(HashMap::new()),
-        }
+        })
     }
 
     fn next_handle(&self) -> u64 {
@@ -288,12 +325,15 @@ impl Runtime {
         self.transactions.lock().remove(&handle);
     }
 
-    fn shutdown(&self) {
+    fn shutdown(&self) -> Result<(), i32> {
+        self.activity.stop_accepting();
         cancel_all_async();
+        self.activity.wait_idle();
         self.ranges.lock().clear();
         self.transactions.lock().clear();
         self.databases.lock().clear();
         drop(self.network.lock().take());
+        self.executor.shutdown()
     }
 }
 
@@ -442,8 +482,15 @@ pub extern "C" fn fdb_rs_init(api_version: i32) -> i32 {
                 return Err(error_code);
             }
         };
+        let runtime = match Runtime::new(api_version, network) {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                *lifecycle = Lifecycle::Failed(error);
+                return Err(error);
+            }
+        };
         *lifecycle = Lifecycle::Running {
-            runtime: Arc::new(Runtime::new(api_version, network)),
+            runtime: Arc::new(runtime),
             owners: 1,
         };
         Ok(())
@@ -453,22 +500,50 @@ pub extern "C" fn fdb_rs_init(api_version: i32) -> i32 {
 #[unsafe(no_mangle)]
 pub extern "C" fn fdb_rs_shutdown() -> i32 {
     code(|| {
-        let runtime = {
+        enum Release {
+            Shared(Arc<Runtime>),
+            Final(Arc<Runtime>),
+            None,
+        }
+
+        let _owner_release = OWNER_RELEASE.lock();
+        let release = {
             let mut lifecycle = LIFECYCLE.lock();
-            if let Lifecycle::Running { owners, .. } = &mut *lifecycle {
+            if let Lifecycle::Running { runtime, owners } = &mut *lifecycle {
                 if *owners > 1 {
-                    *owners -= 1;
-                    return Ok(());
+                    Release::Shared(Arc::clone(runtime))
+                } else {
+                    match std::mem::replace(&mut *lifecycle, Lifecycle::Stopped) {
+                        Lifecycle::Running { runtime, .. } => Release::Final(runtime),
+                        _ => unreachable!(),
+                    }
+                }
+            } else {
+                match &*lifecycle {
+                    Lifecycle::Failed(error) => return Err(*error),
+                    Lifecycle::Uninitialized | Lifecycle::Stopped => Release::None,
+                    Lifecycle::Running { .. } => unreachable!(),
                 }
             }
-            match std::mem::replace(&mut *lifecycle, Lifecycle::Stopped) {
-                Lifecycle::Running { runtime, .. } => Some(runtime),
-                Lifecycle::Uninitialized | Lifecycle::Stopped => None,
-                Lifecycle::Failed(error) => return Err(error),
-            }
         };
-        if let Some(runtime) = runtime {
-            runtime.shutdown();
+        match release {
+            Release::Shared(runtime) => {
+                runtime.executor.barrier()?;
+                let mut lifecycle = LIFECYCLE.lock();
+                let Lifecycle::Running {
+                    runtime: current,
+                    owners,
+                } = &mut *lifecycle
+                else {
+                    return Err(EXECUTOR_FAILURE);
+                };
+                if !Arc::ptr_eq(current, &runtime) || *owners <= 1 {
+                    return Err(EXECUTOR_FAILURE);
+                }
+                *owners -= 1;
+            }
+            Release::Final(runtime) => runtime.shutdown()?,
+            Release::None => {}
         }
         Ok(())
     })
@@ -570,6 +645,8 @@ pub unsafe extern "C" fn fdb_rs_transaction_get(
         let future = transaction.get(key, snapshot != 0);
         drop(state);
         start_async(
+            &runtime.executor,
+            &runtime.activity,
             request_id,
             callback,
             Box::pin(async move {
@@ -607,6 +684,8 @@ pub unsafe extern "C" fn fdb_rs_transaction_get_many(
             .collect::<Vec<_>>();
         drop(state);
         start_async(
+            &runtime.executor,
+            &runtime.activity,
             request_id,
             callback,
             Box::pin(async move {
@@ -658,6 +737,8 @@ pub unsafe extern "C" fn fdb_rs_transaction_get_key(
         let future = transaction.get_key(&selector, snapshot != 0);
         drop(state);
         start_async(
+            &runtime.executor,
+            &runtime.activity,
             request_id,
             callback,
             Box::pin(async move {
@@ -880,6 +961,8 @@ pub extern "C" fn fdb_rs_range_next(
         let mut cursor = cursor_state.lock();
         let Some(range) = cursor.range.take() else {
             return start_async(
+                &runtime.executor,
+                &runtime.activity,
                 request_id,
                 callback,
                 Box::pin(async { Ok(FfiResult::bytes(Vec::new(), 0)) }),
@@ -893,6 +976,8 @@ pub extern "C" fn fdb_rs_range_next(
         drop(cursor);
         let task_cursor = Arc::clone(&cursor_state);
         start_async(
+            &runtime.executor,
+            &runtime.activity,
             request_id,
             callback,
             Box::pin(async move {
@@ -937,6 +1022,8 @@ pub extern "C" fn fdb_rs_transaction_commit(
         drop(state);
         let task_state = Arc::clone(&transaction_state);
         start_async(
+            &runtime.executor,
+            &runtime.activity,
             request_id,
             callback,
             Box::pin(async move {
@@ -970,6 +1057,8 @@ pub extern "C" fn fdb_rs_transaction_on_error(
         drop(state);
         let task_state = Arc::clone(&transaction_state);
         start_async(
+            &runtime.executor,
+            &runtime.activity,
             request_id,
             callback,
             Box::pin(async move {
@@ -995,26 +1084,19 @@ pub extern "C" fn fdb_rs_transaction_on_error(
 pub extern "C" fn fdb_rs_async_cancel(request_id: u64) -> i32 {
     code(|| {
         if let Some(task) = ASYNC_TASKS.lock().get(&request_id).cloned() {
-            task.cancel();
+            task.cancel.close();
         }
         Ok(())
     })
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn fdb_rs_async_poll(request_id: u64) -> *mut FfiResult {
+pub extern "C" fn fdb_rs_async_take(request_id: u64) -> *mut FfiResult {
     let task = ASYNC_TASKS.lock().get(&request_id).cloned();
-    task.and_then(|task| task.poll(true))
-        .map_or(std::ptr::null_mut(), |result| {
-            Box::into_raw(Box::new(result))
-        })
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn fdb_rs_async_ack(request_id: u64) -> i32 {
-    code(|| {
+    let completion = task.and_then(|task| task.completion.lock().take());
+    completion.map_or(std::ptr::null_mut(), |result| {
         ASYNC_TASKS.lock().remove(&request_id);
-        Ok(())
+        Box::into_raw(Box::new(result))
     })
 }
 
@@ -1094,6 +1176,7 @@ pub extern "C" fn fdb_rs_error_message(error_code: i32) -> *mut c_char {
         INVALID_TRANSACTION_STATE => "invalid transaction state",
         BRIDGE_PANIC => "native bridge panicked",
         ASYNC_CANCELLED => "native async operation cancelled",
+        EXECUTOR_FAILURE => "native async executor failed",
         code => FdbError::from_code(code).message(),
     };
     CString::new(message)
@@ -1131,17 +1214,68 @@ mod tests {
     use super::*;
     use std::ffi::CStr;
     use std::ptr;
-    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+    use std::task::{Context, Poll};
+    use std::time::{Duration, Instant};
 
     static ASYNC_TEST_LOCK: Mutex<()> = Mutex::new(());
-    static TEST_NOTIFICATIONS: AtomicUsize = AtomicUsize::new(0);
+    static TEST_NOTIFICATIONS: LazyLock<(Mutex<usize>, Condvar)> =
+        LazyLock::new(|| (Mutex::new(0), Condvar::new()));
+    static BLOCKING_CALLBACK: LazyLock<(Mutex<BlockingCallbackState>, Condvar)> =
+        LazyLock::new(|| (Mutex::new(BlockingCallbackState::default()), Condvar::new()));
+
+    #[derive(Default)]
+    struct BlockingCallbackState {
+        entered: bool,
+        release: bool,
+        returned: bool,
+    }
 
     unsafe extern "C" fn test_completion(_request_id: u64) {
-        TEST_NOTIFICATIONS.fetch_add(1, AtomicOrdering::Relaxed);
+        let (notifications, changed) = &*TEST_NOTIFICATIONS;
+        *notifications.lock() += 1;
+        changed.notify_all();
+    }
+
+    unsafe extern "C" fn blocking_completion(_request_id: u64) {
+        let (state, changed) = &*BLOCKING_CALLBACK;
+        let mut state = state.lock();
+        state.entered = true;
+        changed.notify_all();
+        while !state.release {
+            changed.wait(&mut state);
+        }
+        state.returned = true;
     }
 
     fn take_notifications() -> usize {
-        TEST_NOTIFICATIONS.swap(0, AtomicOrdering::Relaxed)
+        std::mem::take(&mut *TEST_NOTIFICATIONS.0.lock())
+    }
+
+    fn wait_for_notifications(expected: usize) {
+        let (notifications, changed) = &*TEST_NOTIFICATIONS;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut count = notifications.lock();
+        while *count < expected {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "timed out waiting for async completion"
+            );
+            changed.wait_for(&mut count, remaining);
+        }
+    }
+
+    fn test_executor() -> (OwnedExecutor, Arc<TaskActivity>) {
+        (
+            OwnedExecutor::new().expect("executor should start"),
+            Arc::new(TaskActivity::new()),
+        )
+    }
+
+    fn shutdown_executor(executor: &OwnedExecutor, activity: &TaskActivity) {
+        activity.wait_idle();
+        executor.shutdown().expect("executor should stop");
     }
 
     struct SelfWakingFuture {
@@ -1159,6 +1293,24 @@ mod tests {
             } else {
                 Poll::Ready(Ok(FfiResult::bytes(vec![42], RESULT_PRESENT)))
             }
+        }
+    }
+
+    struct PendingUntilDropped {
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl Future for PendingUntilDropped {
+        type Output = Result<FfiResult, i32>;
+
+        fn poll(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<Self::Output> {
+            Poll::Pending
+        }
+    }
+
+    impl Drop for PendingUntilDropped {
+        fn drop(&mut self) {
+            self.dropped.store(true, AtomicOrdering::Release);
         }
     }
 
@@ -1285,22 +1437,23 @@ mod tests {
     }
 
     #[test]
-    fn async_task_wake_only_notifies_until_the_event_loop_polls() {
+    fn executor_drives_self_waking_future_to_one_completion() {
         let _guard = ASYNC_TEST_LOCK.lock();
+        assert_eq!(take_notifications(), 0);
+        let (executor, activity) = test_executor();
         let request_id = 100_001;
         start_async(
+            &executor,
+            &activity,
             request_id,
             Some(test_completion),
             Box::pin(SelfWakingFuture { pending: true }),
         )
         .expect("task should start");
 
-        assert_eq!(
-            take_notifications(),
-            1,
-            "the wake should notify Deno without polling again on the waking thread"
-        );
-        let result = fdb_rs_async_poll(request_id);
+        wait_for_notifications(1);
+        assert_eq!(take_notifications(), 1);
+        let result = fdb_rs_async_take(request_id);
         assert!(!result.is_null());
         assert_eq!(unsafe { fdb_rs_result_code(result) }, 0);
         assert_eq!(unsafe { fdb_rs_result_length(result) }, 1);
@@ -1310,51 +1463,137 @@ mod tests {
             "callback result should preserve task output"
         );
         unsafe { fdb_rs_result_free(result) };
-        assert!(fdb_rs_async_poll(request_id).is_null());
+        assert!(fdb_rs_async_take(request_id).is_null());
         assert_eq!(take_notifications(), 0);
-        assert!(ASYNC_TASKS.lock().contains_key(&request_id));
-        assert_eq!(fdb_rs_async_ack(request_id), 0);
         assert!(!ASYNC_TASKS.lock().contains_key(&request_id));
+        shutdown_executor(&executor, &activity);
     }
 
     #[test]
-    fn async_task_cancellation_completes_and_waits_for_acknowledgement() {
+    fn cancellation_drops_future_before_reporting_completion() {
         let _guard = ASYNC_TEST_LOCK.lock();
+        assert_eq!(take_notifications(), 0);
+        let (executor, activity) = test_executor();
+        let dropped = Arc::new(AtomicBool::new(false));
         let request_id = 100_002;
         start_async(
+            &executor,
+            &activity,
             request_id,
             Some(test_completion),
-            Box::pin(std::future::pending()),
+            Box::pin(PendingUntilDropped {
+                dropped: Arc::clone(&dropped),
+            }),
         )
         .expect("task should start");
 
         assert_eq!(fdb_rs_async_cancel(request_id), 0);
+        wait_for_notifications(1);
         assert_eq!(take_notifications(), 1);
-        let result = fdb_rs_async_poll(request_id);
+        assert!(dropped.load(AtomicOrdering::Acquire));
+        let result = fdb_rs_async_take(request_id);
         assert!(!result.is_null());
         assert_eq!(unsafe { fdb_rs_result_code(result) }, ASYNC_CANCELLED);
         unsafe { fdb_rs_result_free(result) };
-        assert!(ASYNC_TASKS.lock().contains_key(&request_id));
-        assert_eq!(fdb_rs_async_ack(request_id), 0);
         assert!(!ASYNC_TASKS.lock().contains_key(&request_id));
+        shutdown_executor(&executor, &activity);
     }
 
     #[test]
-    fn async_task_converts_poll_panics_to_bridge_errors() {
+    fn executor_converts_future_panics_to_bridge_errors() {
         let _guard = ASYNC_TEST_LOCK.lock();
+        assert_eq!(take_notifications(), 0);
+        let (executor, activity) = test_executor();
         let request_id = 100_003;
         start_async(
+            &executor,
+            &activity,
             request_id,
             Some(test_completion),
-            Box::pin(async { panic!("test panic") }),
+            Box::pin(async {
+                panic!("test panic");
+                #[allow(unreachable_code)]
+                Ok(FfiResult::ok())
+            }),
         )
         .expect("task should start");
 
+        wait_for_notifications(1);
         assert_eq!(take_notifications(), 1);
-        let result = fdb_rs_async_poll(request_id);
+        let result = fdb_rs_async_take(request_id);
         assert!(!result.is_null());
         assert_eq!(unsafe { fdb_rs_result_code(result) }, BRIDGE_PANIC);
         unsafe { fdb_rs_result_free(result) };
-        assert_eq!(fdb_rs_async_ack(request_id), 0);
+        assert!(!ASYNC_TASKS.lock().contains_key(&request_id));
+        shutdown_executor(&executor, &activity);
+    }
+
+    #[test]
+    fn stopped_activity_rejects_late_task_registration() {
+        let _guard = ASYNC_TEST_LOCK.lock();
+        assert_eq!(take_notifications(), 0);
+        let (executor, activity) = test_executor();
+        let request_id = 100_004;
+        activity.stop_accepting();
+
+        assert_eq!(
+            start_async(
+                &executor,
+                &activity,
+                request_id,
+                Some(test_completion),
+                Box::pin(std::future::pending()),
+            ),
+            Err(BRIDGE_NOT_RUNNING)
+        );
+        assert!(!ASYNC_TASKS.lock().contains_key(&request_id));
+        assert_eq!(take_notifications(), 0);
+        shutdown_executor(&executor, &activity);
+    }
+
+    #[test]
+    fn executor_barrier_waits_for_an_active_callback_to_return() {
+        let _guard = ASYNC_TEST_LOCK.lock();
+        let (executor, activity) = test_executor();
+        let request_id = 100_005;
+        {
+            let mut state = BLOCKING_CALLBACK.0.lock();
+            *state = BlockingCallbackState::default();
+        }
+        start_async(
+            &executor,
+            &activity,
+            request_id,
+            Some(blocking_completion),
+            Box::pin(async { Ok(FfiResult::ok()) }),
+        )
+        .expect("task should start");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut state = BLOCKING_CALLBACK.0.lock();
+        while !state.entered {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(!remaining.is_zero(), "callback did not start");
+            BLOCKING_CALLBACK.1.wait_for(&mut state, remaining);
+        }
+        drop(state);
+
+        let barrier = executor.barrier_receiver();
+        let barrier_was_blocked = matches!(barrier.try_recv(), Err(mpsc::TryRecvError::Empty));
+        {
+            let mut state = BLOCKING_CALLBACK.0.lock();
+            state.release = true;
+            BLOCKING_CALLBACK.1.notify_all();
+        }
+        barrier
+            .recv_timeout(Duration::from_secs(5))
+            .expect("barrier should finish after callback return");
+
+        assert!(barrier_was_blocked);
+        assert!(BLOCKING_CALLBACK.0.lock().returned);
+        let result = fdb_rs_async_take(request_id);
+        assert!(!result.is_null());
+        unsafe { fdb_rs_result_free(result) };
+        shutdown_executor(&executor, &activity);
     }
 }

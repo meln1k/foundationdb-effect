@@ -12,34 +12,35 @@ FoundationDB 7.4 API.
 ## How the interop works
 
 ```text
-Effect.callback ← Deno drain microtask ← shared UnsafeCallback ← ready queue
-       │                                                        ↑
-       └── NativeDriver → Deno.dlopen → foundationdb-rs → Rust wakers ← libfdb_c
+Effect.callback ← Deno microtask ← shared UnsafeCallback ← completed task
+       │                                               ↑
+       └── NativeDriver → Deno.dlopen → foundationdb-rs → async-executor ← libfdb_c
 ```
 
 The Rust library owns opaque database, transaction, and range handles. Deno
 never receives Rust references. `foundationdb-rs` registers
-`fdb_future_set_callback` with FoundationDB and wakes the bridge when each Rust
-future becomes ready. Wakers enqueue request IDs in a native ready queue; its
-empty-to-nonempty transition signals one shared `Deno.UnsafeCallback`. That
-callback queues one microtask and immediately returns. The microtask drains all
-ready futures into one completion batch, crosses FFI once for the batch, copies
-returned keys and values into owned `Uint8Array`s, and resumes the suspended
-Effect fibers. The callback stays referenced only while operations are pending.
-There is no blocking wait and no Deno FFI worker per operation. Cancellation
-keeps the native task alive until Deno has received its final result, so scoped
-transaction handles cannot be closed underneath a future.
+`fdb_future_set_callback` with FoundationDB and wakes a single-threaded,
+explicitly owned `async-executor`. The executor polls Rust futures to completion
+without intermediate Deno callbacks. A completed task signals one shared
+`Deno.UnsafeCallback`; that callback queues a microtask, copies returned keys
+and values into owned `Uint8Array`s, and resumes the suspended Effect fiber. The
+callback stays referenced only while operations are pending. There is no
+blocking wait and no Deno FFI worker per operation. Cancellation races the FDB
+operation against a native channel, drops the `foundationdb-rs` future, and
+notifies Deno only after native cleanup, so scoped transaction handles cannot be
+closed underneath a future.
 
 FoundationDB's network is process-global. `FoundationDb.layer` starts it once,
 keeps its `NetworkAutoStop` guard alive for the layer's scope, then closes
 range, transaction, and database handles before stopping the network and
 unloading the library. Only shutdown uses a Deno nonblocking FFI call because it
-joins FoundationDB's single network thread. With `foundationdb-rs` 0.11, a
-stopped network cannot be restarted in the same process. The native bridge
-reference-counts overlapping `FoundationDb.layer` owners and stops the network
-only after the last owner closes. Applications should still normally provide one
-shared layer for their lifetime; creating a new layer after every owner has
-closed is unsupported.
+waits for pending cancellations and joins both the async executor and
+FoundationDB network threads. With `foundationdb-rs` 0.11, a stopped network
+cannot be restarted in the same process. The native bridge reference-counts
+overlapping `FoundationDb.layer` owners. Each owner release crosses an executor
+barrier before its Deno callback closes, and the last owner stops the network.
+Applications should still normally provide one shared layer for their lifetime;
+creating a new layer after every owner has closed is unsupported.
 
 ## Prerequisites
 
