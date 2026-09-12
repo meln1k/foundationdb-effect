@@ -1,0 +1,10 @@
+/node_modules/
+/target/
+/.deno/
+/.amp/portals/*
+*.tsbuildinfo
+*.so
+*.dylib
+*.dll
+*.dll.lib
+*.pdb

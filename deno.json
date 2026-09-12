@@ -1,0 +1,29 @@
+{
+  "$schema": "https://deno.land/x/deno/cli/schemas/config-file.v1.json",
+  "nodeModulesDir": "auto",
+  "compilerOptions": {
+    "strict": true,
+    "exactOptionalPropertyTypes": true,
+    "noUnusedLocals": true,
+    "noImplicitOverride": true
+  },
+  "test": {
+    "sanitizeOps": true,
+    "sanitizeResources": true
+  },
+  "tasks": {
+    "build:native": "cargo build",
+    "check": "deno fmt --check && deno lint && deno check mod.ts && deno task check:examples && deno test tests/unit",
+    "check:all": "deno task check && cargo fmt -- --check && cargo clippy --all-targets -- -D warnings && cargo test",
+    "check:examples": "deno check examples/*.ts",
+    "test": "deno test tests/unit",
+    "test:all": "deno task test && cargo test && deno task test:integration",
+    "test:integration": "cargo build && deno test --allow-ffi --allow-read tests/integration/live_test.ts",
+    "test:unit": "deno test tests/unit",
+    "typecheck": "deno check mod.ts"
+  },
+  "exports": "./mod.ts",
+  "imports": {
+    "@std/assert": "jsr:@std/assert@^1.0.19"
+  }
+}

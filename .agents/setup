@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+export PATH="$HOME/.deno/bin:$HOME/.cargo/bin:$HOME/.bun/bin:$PATH"
+
+missing_packages=()
+for package in ca-certificates curl libclang-dev pkg-config; do
+  dpkg-query -W -f='${Status}' "$package" 2>/dev/null | grep -q 'install ok installed' || missing_packages+=("$package")
+done
+if ((${#missing_packages[@]} > 0)); then
+  sudo apt-get update
+  sudo apt-get install -y "${missing_packages[@]}"
+fi
+
+deno_version="2.9.6"
+if ! command -v deno >/dev/null 2>&1 ||
+  [[ "$(deno --version | head -n 1)" != "deno $deno_version "* ]]; then
+  curl -fsSL https://deno.land/install.sh | sh -s "v$deno_version"
+fi
+
+if ! command -v cargo >/dev/null 2>&1; then
+  curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs |
+    sh -s -- -y --profile minimal --default-toolchain 1.98.1
+fi
+rustup component add rustfmt clippy
+
+if ! dpkg-query -W -f='${Version}' foundationdb-clients 2>/dev/null | grep -qx '7.4.6'; then
+  package="$(mktemp --suffix=.deb)"
+  trap 'rm -f "$package"' EXIT
+  curl -fL \
+    https://github.com/apple/foundationdb/releases/download/7.4.6/foundationdb-clients_7.4.6-1_amd64.deb \
+    -o "$package"
+  echo '7e29df033c3d1d27701d094651cf87a36fa5b0afc2896c8e4aaf47f549e68365  '"$package" | sha256sum -c -
+  sudo apt-get install -y "$package"
+fi
+
+if ! command -v effect-solutions >/dev/null 2>&1; then
+  bun add --global effect-solutions@0.5.3
+fi
+
+deno ci
+./node_modules/.bin/effect-language-service patch
+cargo fetch --locked

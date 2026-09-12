@@ -1,0 +1,19 @@
+[package]
+name = "effect-foundationdb-native"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85.1"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+foundationdb = { version = "=0.11.0", default-features = false, features = ["embedded-fdb-include", "fdb-7_4"] }
+futures = "0.3.32"
+parking_lot = "0.12.5"
+
+[profile.release]
+lto = "thin"
+strip = "symbols"
