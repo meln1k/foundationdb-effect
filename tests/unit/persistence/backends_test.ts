@@ -1,11 +1,7 @@
 import { assert, assertEquals } from "@std/assert";
-import { Duration, Effect, Encoding, Fiber, Latch, Layer } from "effect";
+import { Duration, Effect, Fiber, Latch, Layer } from "effect";
+import { KeyValueStore, Persistence, RateLimiter } from "effect/persistence";
 import { TestClock } from "effect/testing";
-import {
-  KeyValueStore,
-  Persistence,
-  RateLimiter,
-} from "effect/unstable/persistence";
 import {
   FoundationDb,
   FoundationDbTransaction,
@@ -77,10 +73,7 @@ Deno.test("FoundationDB KeyValueStore supports typed values and atomic modificat
         yield* store.getUint8Array("text"),
         new TextEncoder().encode("hello"),
       );
-      assertEquals(
-        yield* store.get("binary"),
-        Encoding.encodeBase64(new Uint8Array([0, 1, 255])),
-      );
+      assertEquals(yield* store.get("binary"), "AAH/");
       assertEquals(
         yield* store.getUint8Array("binary"),
         new Uint8Array([0, 1, 255]),

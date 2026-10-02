@@ -1,6 +1,6 @@
 /** Effect RateLimiterStore backed by FoundationDB. */
 import { Clock, Duration, Effect, Layer } from "effect";
-import { RateLimiter } from "effect/unstable/persistence";
+import { RateLimiter } from "effect/persistence";
 import { FoundationDb, FoundationDbTransaction } from "../FoundationDb.ts";
 import type { Subspace } from "../tuple/mod.ts";
 import { makeDirectoryStore } from "./internal.ts";

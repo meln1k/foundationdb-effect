@@ -1,6 +1,7 @@
 /** Effect KeyValueStore backed by FoundationDB. */
-import { Effect, Encoding, Layer } from "effect";
-import { KeyValueStore } from "effect/unstable/persistence";
+import { Effect, Layer } from "effect";
+import { Base64 } from "effect/encoding";
+import { KeyValueStore } from "effect/persistence";
 import { FoundationDb, FoundationDbTransaction } from "../FoundationDb.ts";
 import {
   clearChunkedValue,
@@ -65,7 +66,7 @@ const decodeString = (
     return Effect.succeed(decoder.decode(value.subarray(1)));
   }
   if (value[0] === valueTypeUint8Array) {
-    return Effect.succeed(Encoding.encodeBase64(value.subarray(1)));
+    return Effect.succeed(Base64.encode(value.subarray(1)));
   }
   return Effect.fail(
     new KeyValueStoreDataError("invalid KeyValueStore value type"),

@@ -1,6 +1,6 @@
 /** Effect PersistedQueueStore backed by FoundationDB. */
 import { Duration, Effect, Latch, Layer, Schedule } from "effect";
-import { PersistedQueue } from "effect/unstable/persistence";
+import { PersistedQueue } from "effect/persistence";
 import { FoundationDb } from "../FoundationDb.ts";
 import type { PersistedQueueStoreOptions } from "./model.ts";
 import { makeQueueRepository } from "./repository.ts";

@@ -8,7 +8,7 @@ import {
   Stream,
   SynchronizedRef,
 } from "effect";
-import { Persistence } from "effect/unstable/persistence";
+import { Persistence } from "effect/persistence";
 import { FoundationDb, FoundationDbTransaction } from "../FoundationDb.ts";
 import {
   clearChunkedValue,

@@ -6,8 +6,8 @@ A small Rust `cdylib` exposes
 Deno FFI; the TypeScript API handles scopes, typed errors, transaction retries,
 and range streams.
 
-The project pins `effect@4.0.0-rc.115`, `foundationdb@0.11.0`, and the
-FoundationDB 7.4 API.
+The project pins `effect@4.0.0`, `foundationdb@0.11.0`, and the FoundationDB 7.4
+API.
 
 ## How the interop works
 
@@ -319,7 +319,7 @@ The package provides FoundationDB layers for Effect's `KeyValueStore`,
 
 ```ts
 import { Layer } from "effect";
-import { Persistence, RateLimiter } from "effect/unstable/persistence";
+import { Persistence, RateLimiter } from "effect/persistence";
 import {
   FoundationDb,
   layerBackingPersistence,
@@ -369,7 +369,7 @@ layer and Effect's queue factory layer:
 
 ```ts
 import { Effect, Layer, Schema } from "effect";
-import { PersistedQueue } from "effect/unstable/persistence";
+import { PersistedQueue } from "effect/persistence";
 import { FoundationDb, layerPersistedQueueStore } from "./mod.ts";
 
 const foundationDbLayer = FoundationDb.layer({

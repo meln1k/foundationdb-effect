@@ -11,8 +11,8 @@ import {
   Schema,
   Scope,
 } from "effect";
+import { PersistedQueue } from "effect/persistence";
 import { TestClock } from "effect/testing";
-import { PersistedQueue } from "effect/unstable/persistence";
 import {
   DirectoryLayer,
   DirectorySubspace,

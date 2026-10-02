@@ -5,7 +5,7 @@
     "jsr:@std/internal@^1.0.12": "1.0.14",
     "npm:@effect/language-service@~0.87.2": "0.87.2",
     "npm:@types/deno@2.7.0": "2.7.0",
-    "npm:effect@4.0.0-rc.115": "4.0.0-rc.115",
+    "npm:effect@4.0.0": "4.0.0",
     "npm:typescript@6.0.3": "6.0.3"
   },
   "jsr": {
@@ -27,8 +27,8 @@
     "@types/deno@2.7.0": {
       "integrity": "sha512-Y6fWcV8KpYeO3Lik/RiYnUxtr/LWqoeACciU0CA+dr1U/45tGgaX3HWQQAPCNN53raN4Rr4Fht4y6qsUH57fDA=="
     },
-    "effect@4.0.0-rc.115": {
-      "integrity": "sha512-ogYulZ5ffeOzrJqQrG0XOkDO5lKn2s9KNHhoxJy/6wKUkF0i12dlVXWA9TgsgQ+zV/JzizyG0+XMPepZEQX6vw=="
+    "effect@4.0.0": {
+      "integrity": "sha512-ooc1TG5t+FfzgYnFz2ff6BBKyZ7EwBRVXC7c4RhQUAD6/TZ2gTXXMeb4WX7a19ozQo4J73/QW+S00YAIresoMQ=="
     },
     "typescript@6.0.3": {
       "integrity": "sha512-y2TvuxSZPDyQakkFRPZHKFm+KKVqIisdg9/CZwm9ftvKXLP8NRWj38/ODjNbr43SsoXqNuAisEf1GdCxqWcdBw==",
@@ -43,7 +43,7 @@
       "dependencies": [
         "npm:@effect/language-service@~0.87.2",
         "npm:@types/deno@2.7.0",
-        "npm:effect@4.0.0-rc.115",
+        "npm:effect@4.0.0",
         "npm:typescript@6.0.3"
       ]
     }

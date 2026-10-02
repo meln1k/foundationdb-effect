@@ -9,7 +9,7 @@ import {
   Schema,
   Scope,
 } from "effect";
-import { PersistedQueue } from "effect/unstable/persistence";
+import { PersistedQueue } from "effect/persistence";
 import {
   ConflictRangeType,
   DirectoryLayer,
