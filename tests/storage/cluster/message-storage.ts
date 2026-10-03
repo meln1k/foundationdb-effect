@@ -109,8 +109,10 @@ storageTest(
         messagesByShard: ["shard"],
         messagesByAddress: ["address"],
         messagesByRequest: ["request"],
-        unfinishedByShard: ["unfinished", "shard"],
-        unfinishedByAddress: ["unfinished", "address"],
+        readyByShard: ["ready", "shard"],
+        readyByAddress: ["ready", "address"],
+        scheduledByShard: ["scheduled", "shard"],
+        scheduledByAddress: ["scheduled", "address"],
         orders: ["order"],
       };
       const suffix: Tuple = ["a\u0000b", 37n];
@@ -124,12 +126,12 @@ storageTest(
           yield* root.range([...layout[name], ...suffix]),
         );
       }
-      const shard = yield* spaces.unfinishedByShard.subspace(["default:2"]);
+      const shard = yield* spaces.readyByShard.subspace(["default:2"]);
       const stamp = yield* Versionstamp.incomplete(19);
       assertEquals(
         yield* shard.packWithVersionstamp([stamp, "900"]),
         yield* root.packWithVersionstamp([
-          "unfinished",
+          "ready",
           "shard",
           "default:2",
           stamp,

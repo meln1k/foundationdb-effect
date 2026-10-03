@@ -19,11 +19,14 @@ interface Pending {
 }
 interface Attempt {
   next: number;
-  readonly roots: Map<string, Map<string, Pending>>;
+  readonly roots: Map<string, {
+    readonly pending: Map<string, Pending>;
+    readonly committed: Map<string, Versionstamp>;
+  }>;
 }
 
 // The service object is fresh for every FDB attempt. A WeakMap shares pending
-// writes across independently constructed adapters, without leaking retries.
+// writes and observed order across adapters, without leaking snapshots or retries.
 const attempts = new WeakMap<FoundationDbTransaction["Service"], Attempt>();
 const pendingFor = (store: Store) => {
   let attempt = attempts.get(store.transaction);
@@ -32,12 +35,12 @@ const pendingFor = (store: Store) => {
     attempts.set(store.transaction, attempt);
   }
   const namespace = store.spaces.orders.prefix.join(",");
-  let pending = attempt.roots.get(namespace);
-  if (pending === undefined) {
-    pending = new Map();
-    attempt.roots.set(namespace, pending);
+  let root = attempt.roots.get(namespace);
+  if (root === undefined) {
+    root = { pending: new Map(), committed: new Map() };
+    attempt.roots.set(namespace, root);
   }
-  return { attempt, pending };
+  return { attempt, ...root };
 };
 const Stamp = Schema.Tuple([Versionstamp.schema]);
 const OrderedId = Schema.Tuple([Versionstamp.schema, Schema.String]);
@@ -86,8 +89,11 @@ export const insertMessageOrder = Effect.fnUntraced(function* (
 
 export const messageOrder = Effect.fnUntraced(
   function* (store: Store, id: string) {
-    const pending = pendingFor(store).pending.get(id);
+    const root = pendingFor(store);
+    const pending = root.pending.get(id);
     if (pending !== undefined) return pending.stamp;
+    const observed = root.committed.get(id);
+    if (observed !== undefined) return observed;
     const value = yield* store.transaction.get(
       yield* store.spaces.orders.pack([id]),
     );
@@ -148,7 +154,9 @@ export const removeMessageOrder = Effect.fnUntraced(function* (
   indexes: ReadonlyArray<Subspace>,
 ) {
   yield* setMessageOrderIndexed(store, id, indexes, false);
-  pendingFor(store).pending.delete(id);
+  const root = pendingFor(store);
+  root.pending.delete(id);
+  root.committed.delete(id);
   yield* store.transaction.clear(yield* store.spaces.orders.pack([id]));
 });
 
@@ -159,6 +167,7 @@ export const visitMessageOrder = Effect.fnUntraced(function* <E>(
   indexes: ReadonlyArray<Subspace>,
   visit: (ids: ReadonlyArray<string>) => Effect.Effect<boolean, E>,
 ) {
+  const { committed } = pendingFor(store);
   let batch: Array<string> = [];
   const append = Effect.fnUntraced(function* (id: string) {
     batch.push(id);
@@ -215,6 +224,9 @@ export const visitMessageOrder = Effect.fnUntraced(function* <E>(
       }
     }
     if (selected === undefined) break;
+    // The conflict-checked index read already supplied this stamp. Claiming
+    // clears its exact ready keys without one extra locator round trip per row.
+    committed.set(selected.head![1], selected.head![0]);
     if (!(yield* append(selected.head![1]))) return;
     selected.head = yield* selected.next;
   }

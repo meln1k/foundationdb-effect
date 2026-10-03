@@ -428,6 +428,168 @@ an application-owned directory layer or partition. Queue transactions default to
 a 5-second timeout, 10 retries, and a 1-second maximum retry delay, so an
 interrupted claim cannot remain stuck behind an unbounded FoundationDB retry.
 
+## Effect Cluster and Workflow storage
+
+`layerMessageStorage` implements `MessageStorage` and `layerRunnerStorage`
+implements `RunnerStorage`. Both accept `directory`, `directoryPath`, and
+`transactionOptions`, with separate default directories below
+`effect-foundationdb`.
+
+```ts
+import { Layer } from "effect";
+import { ShardingConfig } from "effect/cluster";
+import {
+  FoundationDb,
+  layerMessageStorage,
+  layerRunnerStorage,
+} from "./mod.ts";
+
+const clusterStorage = Layer.mergeAll(
+  layerMessageStorage(),
+  layerRunnerStorage(),
+).pipe(
+  Layer.provide(ShardingConfig.layer()),
+  Layer.provide(FoundationDb.layer({
+    libraryPath: "./target/release/libeffect_foundationdb_native.so",
+  })),
+);
+```
+
+These are storage layers, not a complete cluster runtime. Compose them with
+Effect's sharding and transport layers; `ClusterWorkflowEngine` can then use the
+durable mailbox for workflows. Effect's SQL-specific `SingleRunner.layer` does
+not accept these backends. `makeMessageStorage` uses a caller-supplied
+`Snowflake.Generator`; `layerMessageStorage` supplies the standard generator.
+Runner storage requires `ShardingConfig` and uses its `shardLockExpiration`.
+Cluster applications need Deno's `--allow-env`: Effect 4.0 initializes an
+environment provider when loading `ShardingConfig`. Basic package imports do not
+load that configuration module.
+
+The mailbox stores chunked envelopes and replies, transactional primary-key
+deduplication, delayed delivery, streaming acknowledgements, and exclusive
+claims. Bounded reads claim only the returned messages. Claims expire after ten
+minutes or can be reset by the cluster. Conditional reply clearing compares the
+expected reply inside the transaction, protecting workflows from stale resumes.
+Completed messages remain until `clearAddress`; broad resets and clears must fit
+within FoundationDB's transaction limits.
+
+Polling uses ready-by-shard and ready-by-address indexes ordered by the original
+enqueue versionstamp. Delayed messages and active claims live in separate
+time-ordered indexes, keyed by the later of delivery time and claim expiration.
+Polling promotes due entries only within the requested shards/addresses, then
+merges the ready indexes. It does not fetch metadata for future timers,
+acknowledgement-blocked messages, superseded ACKs, or completed history.
+
+Claims, ACKs, replies, resets, and clears update both polling index families in
+the same transaction as their metadata. Unacknowledged chunks remove their
+request's messages from polling; the final ACK restores eligible siblings and
+replaces the previous ACK. Terminal replies remove ready entries and timers;
+late envelopes for completed requests stay out too. Reopening restores retained
+messages at their original versionstamp positions, subject to delays and ACK
+state (except interrupts discarded by an unconditional clear). By-ID reads still
+ignore claims without promoting timers or claiming messages.
+
+Timer promotion runs in 64-entry pages before selection, in the same
+transaction. All due entries in the selected scope are promoted so an older
+message cannot be hidden behind a timer page boundary. This is not a
+transaction-work budget: a large simultaneously due backlog, unlimited poll, or
+bulk reset/clear must still fit FoundationDB's transaction limits. No background
+promoter is required.
+
+Polling reads up to 64 ordered candidates at a time. Message metadata and
+distinct request states use point records fetched with `getMany`; envelopes and
+replies remain chunked. Only eligible messages within the remaining result limit
+have their payloads loaded, with at most eight concurrent payload readers.
+Results retain versionstamp order regardless of read completion order. Metadata
+prefetch can exceed the result limit, but only returned messages are claimed, in
+the same conflict-checked transaction. By-ID reads use the same batching without
+claiming messages.
+
+Mailbox selection uses FDB commit versionstamps, not producer clocks or numeric
+Snowflake order. Snowflakes remain protocol IDs. Paged shard/entity indexes are
+merged before applying the batch limit, and by-ID reads use the same order. An
+explicit 16-bit user version preserves insertion order within a transaction (at
+most 65,536 new envelopes per transaction attempt). Delays, acknowledgements,
+and claims still determine eligibility; enqueue order is not an execution-order
+guarantee across workers.
+
+Pending entries are tracked per transaction attempt, so enqueue/read/reset/clear
+operations compose before commit without reading FDB's unreadable versionstamped
+keys. Cancelling a pending entry rebuilds the affected pending index tails with
+read-conflict protection against concurrent enqueues. Committed entries use a
+versionstamped locator for exact index cleanup.
+
+Runner registration assigns unique 10-bit machine IDs. Expired registrations
+retain their IDs to prevent a late heartbeat from reviving an ID reassigned to
+another runner: explicitly unregister retired addresses to reclaim slots. At
+most 1024 addresses can remain registered. Lease ownership checks prevent stale
+runners from releasing another runner's shards. Hosts must synchronize clocks
+and use consistent lease settings.
+
+## Effect EventLog storage
+
+The following layers each require `FoundationDb`; matching `make…` constructors
+return the service directly:
+
+| Layer                                   | Effect service                      | Default directory suffix |
+| --------------------------------------- | ----------------------------------- | ------------------------ |
+| `layerEventJournal`                     | `EventJournal.EventJournal`         | `eventlog/journal`       |
+| `layerEventLogServerEncryptedStorage`   | `EventLogServerEncrypted.Storage`   | `eventlog/encrypted`     |
+| `layerEventLogServerUnencryptedStorage` | `EventLogServerUnencrypted.Storage` | `eventlog/unencrypted`   |
+
+The journal persists local and remote events, replication acknowledgements,
+sequence progress, and conflict indexes. Compaction controls replay while the
+original incoming entries remain stored. The server stores persist their remote
+IDs, first-writer session authentication bindings, and isolated per-store
+sequences. Encrypted storage additionally isolates public keys, starts sequences
+at zero, and returns only newly inserted entries on duplicate writes. Plain
+storage starts at one and rejects duplicate IDs atomically, matching Effect's
+in-memory contracts. Encryption itself remains Effect's responsibility.
+
+The journal's insertion and local-change indexes use FDB versionstamped keys,
+not shared sequence-allocation counters. Entries follow commit order, with a
+transaction-local ordinal preserving insertion order within each transaction.
+Event IDs and replay order remain UUID-based; server protocol sequences remain
+numeric. A transaction can allocate up to 65,536 journal ordinals per directory,
+subject to FDB's usually tighter size and lifetime limits.
+
+Outgoing journal replication stores the last processed committed index key per
+remote. Acknowledged history is skipped on subsequent calls; newly received
+events with older UUID timestamps still get sent. Acknowledgement checks use
+batched point reads, and only unacknowledged payloads are loaded. Callbacks
+still receive events in UUID order, and a failed callback rolls back
+acknowledgements and progress. Nested operations see transaction-local pending
+entries, but those entries cannot advance the durable cursor past unseen
+concurrent commits.
+
+Event-log records use SchemaBinary encoding and 8 KiB chunks. Changes are read
+from durable indexes, so independently constructed instances observe each
+other's commits. Journal subscriptions start after their initial FDB read
+version, excluding history without missing writes during setup. Payload reads
+run with concurrency 8 while preserving result order. `pageSize` defaults
+to 100. Idle change streams wait on FDB watches registered atomically with the
+empty read, rather than polling. The `watchRetryDelayMs` option (default 100)
+applies only after a failed watch. Journal subscriptions buffer at most
+`pageSize` entries plus an in-flight page; slow subscribers backpressure their
+own feed without blocking other subscribers or writes. Scope closure cancels
+producers and watches. New-remote catch-up, array APIs, and backlog compaction
+still accumulate complete results in memory.
+
+Journal callbacks and plain-server `withTransaction` share a real FDB
+transaction with nested operations. `EventJournal.withLock` uses optimistic
+serializable transactions, not a pessimistic mutex: callbacks can overlap, but
+conflicting commits cannot both succeed. Callback transactions default to zero
+retries; set `callbackRetryLimit` only when callbacks are safe to repeat.
+External side effects cannot roll back. Nested operations have no savepoints and
+must use the same database; propagate failures to the outer boundary and consume
+change streams outside transactions. Atomic batches and callback units must fit
+FDB's transaction size and lifetime limits.
+
+All five backends reject automatic replay after an ambiguous commit. Ordinary
+storage transactions use bounded retries; mailbox `withTransaction` callbacks
+can therefore repeat on definite conflicts. An explicitly supplied ambient FDB
+transaction controls its own retry policy.
+
 ## Development
 
 The repository includes the Effect Solutions quick-start configuration and
@@ -437,12 +599,54 @@ for the patched standalone TypeScript language service; Deno itself and
 repository root:
 
 ```sh
-deno task check:all       # formatting, lint, types, Deno unit tests, Rust tests and clippy
-deno task test:integration # requires a local cluster and /etc/foundationdb/fdb.cluster
+deno task test             # unit tests + storage and integration tests on real FDB
+deno task check:all        # formatting, lint, types, all Deno tests, Rust tests and clippy
+deno task test:unit        # database-free codec, bridge and fault-injection tests only
+deno task test:storage     # real-FDB storage behavior and native integration tests
+deno task test:integration # native integration test alone, on the local FDB service
 ```
+
+`check:all` also runs `npm run typecheck`, which applies the Effect
+language-service patch before running `tsc`. Effect diagnostics are checked
+alongside Deno's type checks, regardless of whether dependency installation ran
+npm's prepare script.
+
+Storage behavior tests use **real FoundationDB**, not an in-memory database. The
+launcher connects to the persistent local service using
+`/etc/foundationdb/fdb.cluster`. Each case allocates a randomly named FDB
+directory and places its data, directory metadata, and manual prefixes inside
+it. Cleanup removes only that directory, on success or failure; it never clears
+the database. An abruptly killed process can leave its directory behind.
+Independent test runs can share the service. Storage cases within a run execute
+sequentially, sharing one native network lifetime with resource/operation
+sanitizers enabled. Concurrent operations use real FDB conflict detection and
+retries.
+
+Install and start FoundationDB **7.4.6 client and server packages** before
+running the default checks. In an orb, `.agents/setup` installs the packages and
+`.amp/services.yaml` runs the persistent single-node database under Amp's
+service supervisor (instead of the package's system service):
+
+```sh
+.agents/setup
+amp orb services ensure
+deno task test
+```
+
+Outside an orb, use the installed FoundationDB service. Set
+`FDB_TEST_CLUSTER_FILE` to select a different **development** cluster and
+`FDBCLI` if the CLI is not on `PATH`. The launcher checks transactional
+readiness and fails rather than falling back to a fake if FDB is unavailable. It
+does not start, stop, or reconfigure the service. `tests/storage/` contains
+storage behavior cases; narrow wrappers around real operations remain for
+explicit fault injection and watch-lifecycle observation.
 
 The live integration test builds the debug bridge and covers binary and empty
 values, missing values, read-your-writes, key selectors, range order and limits,
 clears, Effect key-value storage, backing persistence, rate limiting, and
-`PersistedQueue` de-duplication, retries, and concurrent workers. It runs as one
-test because the FoundationDB network cannot restart inside one process.
+`PersistedQueue` de-duplication, retries, and concurrent workers. It also covers
+competing mailbox claims and shard leases, event-log authentication bindings,
+cross-instance change feeds, chunked payloads, transaction rollback, and a
+forced FDB conflict with callback retry. Mailbox coverage includes committed and
+pending versionstamp ordering and cancellation racing a foreign enqueue. It runs
+as one test because the FoundationDB network cannot restart inside one process.

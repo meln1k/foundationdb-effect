@@ -147,11 +147,12 @@ storageTest(
         "100",
         "900",
       ]);
+      yield* first.resetShards(shards);
       yield* db.withTransaction(Effect.gen(function* () {
         const root = yield* directory.open(["ordered"]);
         assert(root instanceof DirectorySubspace);
         const tx = yield* FoundationDbTransaction;
-        const [begin, end] = yield* root.range(["unfinished", "shard"]);
+        const [begin, end] = yield* root.range(["ready", "shard"]);
         const rows = yield* Stream.runCollect(
           tx.getRange(keyRange(begin, end)),
         );
@@ -248,7 +249,7 @@ const entries = Effect.fnUntraced(function* (space: Subspace) {
 });
 
 storageTest(
-  "unfinished polling does not read completed history in either index",
+  "ready polling does not read completed history in either index",
   () =>
     run(Effect.gen(function* () {
       const fixture = testDatabase();
@@ -268,8 +269,8 @@ storageTest(
           complete(store, id, String(Number(id) + 10000)), { discard: true }),
       );
       const spaces = yield* makeMessageSubspaces(yield* mailboxRoot);
-      assertEquals(yield* entries(spaces.unfinishedByShard), []);
-      assertEquals(yield* entries(spaces.unfinishedByAddress), []);
+      assertEquals(yield* entries(spaces.readyByShard), []);
+      assertEquals(yield* entries(spaces.readyByAddress), []);
       assertEquals((yield* entries(spaces.orders)).length, 130);
       assertEquals((yield* store.repliesFor(["1000"]))[0].id, "11000");
       assertEquals((yield* save(store, "1000"))._tag, "Duplicate");
@@ -331,13 +332,15 @@ storageTest(
         ["1"],
       );
       assertEquals(metadataReads, 1);
-      assertEquals((yield* entries(spaces.unfinishedByShard)).length, 2);
-      assertEquals((yield* entries(spaces.unfinishedByAddress)).length, 2);
+      assertEquals(yield* entries(spaces.readyByShard), []);
+      assertEquals(yield* entries(spaces.readyByAddress), []);
+      assertEquals((yield* entries(spaces.scheduledByShard)).length, 2);
+      assertEquals((yield* entries(spaces.scheduledByAddress)).length, 2);
     })),
 );
 
 storageTest(
-  "completion, late envelopes, reopening and rollback maintain unfinished indexes and original stamps",
+  "completion, late envelopes, reopening and rollback maintain ready indexes and original stamps",
   () =>
     run(Effect.gen(function* () {
       const store = yield* makeEncodedMessageStorage({
@@ -380,21 +383,21 @@ storageTest(
         exit: { _tag: "Failure", cause: [{ _tag: "Fail", error: "rejected" }] },
       });
       yield* save(store, "700");
-      assertEquals((yield* entries(spaces.unfinishedByShard)).length, 1);
-      assertEquals((yield* entries(spaces.unfinishedByAddress)).length, 1);
+      assertEquals((yield* entries(spaces.readyByShard)).length, 1);
+      assertEquals((yield* entries(spaces.readyByAddress)).length, 1);
       yield* store.resetShards(shards);
       yield* store.resetAddresses([a, b]);
       yield* store.resetRequests([Snowflake.Snowflake("900")]);
       yield* store.clearReplies(Snowflake.Snowflake("900"), {
         expectedReplyId: Snowflake.Snowflake("8999"),
       });
-      assertEquals((yield* entries(spaces.unfinishedByShard)).length, 1);
+      assertEquals((yield* entries(spaces.readyByShard)).length, 1);
 
       yield* store.clearReplies(Snowflake.Snowflake("900"), {
         expectedReplyId: Snowflake.Snowflake("9000"),
       });
-      assertEquals((yield* entries(spaces.unfinishedByShard)).length, 4);
-      assertEquals((yield* entries(spaces.unfinishedByAddress)).length, 4);
+      assertEquals((yield* entries(spaces.readyByShard)).length, 4);
+      assertEquals((yield* entries(spaces.readyByAddress)).length, 4);
       const polled = yield* store.unprocessedMessages(shards, 0, {
         addresses: [b, a],
       });
@@ -410,7 +413,7 @@ storageTest(
       }
 
       const beforeRollback = yield* entries(
-        yield* root.subspace(["unfinished"]),
+        root,
       );
       const failed = yield* Effect.exit(
         store.withTransaction(Effect.gen(function* () {
@@ -421,14 +424,15 @@ storageTest(
       );
       assert(Exit.isFailure(failed));
       assertEquals(
-        yield* entries(yield* root.subspace(["unfinished"])),
+        yield* entries(root),
         beforeRollback,
       );
       assertEquals((yield* store.repliesFor(["700"]))[0].id, "7000");
       yield* complete(store, "900", "9001");
       yield* store.clearReplies(Snowflake.Snowflake("900"));
       // Unconditional reopen removes interrupts but retains the request and ACK.
-      assertEquals((yield* entries(spaces.unfinishedByShard)).length, 3);
+      assertEquals((yield* entries(spaces.readyByShard)).length, 2);
+      assertEquals((yield* entries(spaces.scheduledByShard)).length, 1);
       yield* store.clearAddress(a);
       yield* store.clearAddress(b);
       assertEquals(yield* entries(root), []);
@@ -475,8 +479,8 @@ storageTest(
       }));
       const root = yield* mailboxRoot;
       const spaces = yield* makeMessageSubspaces(root);
-      assertEquals((yield* entries(spaces.unfinishedByShard)).length, 2);
-      assertEquals((yield* entries(spaces.unfinishedByAddress)).length, 2);
+      assertEquals((yield* entries(spaces.readyByShard)).length, 2);
+      assertEquals((yield* entries(spaces.readyByAddress)).length, 2);
       assertEquals((yield* entries(spaces.orders)).length, 4);
       assertEquals(ids(yield* second.unprocessedMessages(shards, 0)), [
         "900",
@@ -497,7 +501,7 @@ storageTest(
 );
 
 storageTest(
-  "an envelope racing a committed completion retries without leaving unfinished entries",
+  "an envelope racing a committed completion retries without leaving ready entries",
   () =>
     run(Effect.gen(function* () {
       const options = { directory: testDatabase().directory };
@@ -527,8 +531,8 @@ storageTest(
       assert(attempts >= 2);
       const root = yield* mailboxRoot;
       const spaces = yield* makeMessageSubspaces(root);
-      assertEquals(yield* entries(spaces.unfinishedByShard), []);
-      assertEquals(yield* entries(spaces.unfinishedByAddress), []);
+      assertEquals(yield* entries(spaces.readyByShard), []);
+      assertEquals(yield* entries(spaces.readyByAddress), []);
       assertEquals((yield* entries(spaces.orders)).length, 2);
       yield* writer.clearReplies(Snowflake.Snowflake("900"), {
         expectedReplyId: Snowflake.Snowflake("9000"),
@@ -540,7 +544,9 @@ storageTest(
         ),
         ["900", "100"],
       );
-      assertEquals((yield* entries(spaces.unfinishedByShard)).length, 2);
-      assertEquals((yield* entries(spaces.unfinishedByAddress)).length, 2);
+      assertEquals(yield* entries(spaces.readyByShard), []);
+      assertEquals(yield* entries(spaces.readyByAddress), []);
+      assertEquals((yield* entries(spaces.scheduledByShard)).length, 2);
+      assertEquals((yield* entries(spaces.scheduledByAddress)).length, 2);
     })),
 );

@@ -30,6 +30,8 @@ import {
   Versionstamp,
 } from "../../mod.ts";
 import type { Directory, DirectoryOutput } from "../../mod.ts";
+import { makeTestFixture, testClusterFile } from "../support/real-database.ts";
+import { testClusterAndEventlog } from "./backends.ts";
 
 const encoder = new TextEncoder();
 const bytes = (value: string): Uint8Array => encoder.encode(value);
@@ -46,26 +48,22 @@ const directoryPrefixIds = (
 
 Deno.test({
   name: "live FFI bridge performs primitives and Effect persistence operations",
-  permissions: { ffi: true, read: true },
+  permissions: { env: true, ffi: true, read: true },
   timeout: 120_000,
   fn: async () => {
-    const prefix = bytes(
-      `\x02effect-foundationdb/${Date.now()}-${Math.random()}/`,
-    );
-    const end = new Uint8Array([...prefix, 0xff]);
-    const firstKey = new Uint8Array([...prefix, 1]);
-    const secondKey = new Uint8Array([...prefix, 2]);
-    const thirdKey = new Uint8Array([...prefix, 3]);
-    const watchKey = new Uint8Array([...prefix, 4]);
-    const conflictKey = new Uint8Array([...prefix, 5]);
     const empty = new Uint8Array();
     const binary = new Uint8Array([0, 255, 1, 128]);
     const thirdValue = bytes("third");
 
-    const program = (persistenceDirectory: Directory) =>
+    const program = (persistenceDirectory: Directory, prefix: Uint8Array) =>
       Effect.gen(function* () {
+        const end = new Uint8Array([...prefix, 0xff]);
+        const firstKey = new Uint8Array([...prefix, 1]);
+        const secondKey = new Uint8Array([...prefix, 2]);
+        const thirdKey = new Uint8Array([...prefix, 3]);
+        const watchKey = new Uint8Array([...prefix, 4]);
+        const conflictKey = new Uint8Array([...prefix, 5]);
         const database = yield* FoundationDb;
-        yield* database.clearRange(prefix, end);
 
         const readYourWrites = yield* database.withTransaction(
           Effect.gen(function* () {
@@ -418,18 +416,13 @@ Deno.test({
         const largeQueueValue = { value: "queue-value-".repeat(12_000) };
         yield* largeQueue.offer(largeQueueValue);
         assertEquals(yield* largeQueue.take(Effect.succeed), largeQueueValue);
-      }).pipe(
-        Effect.ensuring(
-          Effect.gen(function* () {
-            const database = yield* FoundationDb;
-            yield* database.clearRange(prefix, end);
-          }).pipe(Effect.ignore),
-        ),
-      );
+
+        yield* testClusterAndEventlog(persistenceDirectory);
+      });
 
     const foundationDbOptions = {
       libraryPath: "./target/debug/libeffect_foundationdb_native.so",
-      clusterFile: "/etc/foundationdb/fdb.cluster",
+      clusterFile: testClusterFile(),
     } as const;
 
     await Effect.runPromise(
@@ -453,17 +446,15 @@ Deno.test({
         const firstDatabase = Context.get(firstContext, FoundationDb);
         const secondDatabase = Context.get(secondContext, FoundationDb);
 
-        assertEquals(yield* firstDatabase.get(firstKey), undefined);
+        const fixture = yield* makeTestFixture(secondDatabase);
+        assertEquals(yield* firstDatabase.get(fixture.prefix(1, 1)), undefined);
         yield* Scope.close(firstScope, Exit.succeed(undefined));
 
         const foundationDbLayer = Layer.succeed(
           FoundationDb,
           secondDatabase,
         );
-        const queueDirectory = yield* DirectoryLayer.make({
-          nodeSubspace: new Subspace(new Uint8Array([...prefix, 0xf0])),
-          contentSubspace: new Subspace(new Uint8Array([...prefix, 0xf1])),
-        });
+        const queueDirectory = fixture.directory;
         const storeLayer = layerPersistedQueueStore({
           directory: queueDirectory,
           directoryPath: ["persisted-queue"],
@@ -473,7 +464,9 @@ Deno.test({
           Layer.provideMerge(storeLayer),
         );
 
-        yield* program(queueDirectory).pipe(Effect.provide(applicationLayer));
+        yield* program(queueDirectory, fixture.prefix(1)).pipe(
+          Effect.provide(applicationLayer),
+        );
       })),
     );
   },

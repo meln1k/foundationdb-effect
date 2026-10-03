@@ -41,6 +41,30 @@ export type {
   RateLimiterStoreOptions,
 } from "./src/persistence/mod.ts";
 export {
+  layerMessageStorage,
+  makeMessageStorage,
+} from "./src/cluster/message-storage.ts";
+export type { MessageStorageOptions } from "./src/cluster/message-storage.ts";
+export {
+  layerRunnerStorage,
+  makeRunnerStorage,
+} from "./src/cluster/runner-storage.ts";
+export type { RunnerStorageOptions } from "./src/cluster/runner-storage.ts";
+export {
+  layerEventJournal,
+  layerEventLogServerEncryptedStorage,
+  layerEventLogServerUnencryptedStorage,
+  makeEventJournal,
+  makeEventLogServerEncryptedStorage,
+  makeEventLogServerUnencryptedStorage,
+} from "./src/eventlog/mod.ts";
+export type {
+  EventJournalOptions,
+  EventLogServerEncryptedStorageOptions,
+  EventLogServerUnencryptedStorageOptions,
+  EventLogStoreOptions,
+} from "./src/eventlog/mod.ts";
+export {
   ConflictRange,
   ConflictRangeType,
   keyRange,

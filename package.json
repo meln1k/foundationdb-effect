@@ -11,7 +11,7 @@
     "prepare": "effect-language-service patch",
     "test": "deno task test",
     "test:integration": "deno task test:integration",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "effect-language-service patch && tsc --noEmit"
   },
   "dependencies": {
     "effect": "4.0.0"
