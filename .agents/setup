@@ -32,7 +32,61 @@ if ! dpkg-query -W -f='${Version}' foundationdb-clients 2>/dev/null | grep -qx '
     -o "$package"
   echo '7e29df033c3d1d27701d094651cf87a36fa5b0afc2896c8e4aaf47f549e68365  '"$package" | sha256sum -c -
   sudo apt-get install -y "$package"
+  rm -f "$package"
 fi
+
+echo 'Preparing persistent FoundationDB 7.4.6 (started by amp orb services ensure)'
+# The official postinst starts the service and initializes a database when it
+# creates fdb.cluster. It calls systemctl directly despite its policy-rc.d
+# comment, so a mask would fail installation. Supply the cluster first and
+# make both package service entry points no-ops: only Amp owns the process.
+sudo install -d -o foundationdb -g foundationdb -m 0755 /etc/foundationdb
+if [[ ! -f /etc/foundationdb/fdb.cluster ]]; then
+  printf 'orb:%s@127.0.0.1:4500\n' "$(cat /proc/sys/kernel/random/uuid | tr -d '-')" |
+    sudo tee /etc/foundationdb/fdb.cluster >/dev/null
+  sudo chown foundationdb:foundationdb /etc/foundationdb/fdb.cluster
+  sudo chmod 0644 /etc/foundationdb/fdb.cluster
+fi
+sudo tee /etc/systemd/system/foundationdb.service >/dev/null <<'EOF'
+[Unit]
+Description=FoundationDB is supervised by Amp, not systemd
+
+[Service]
+Type=oneshot
+ExecStart=/bin/true
+EOF
+sudo systemctl daemon-reload
+if [[ -z "$(dpkg-divert --list /etc/init.d/foundationdb)" ]]; then
+  sudo dpkg-divert --local --add --rename \
+    --divert /etc/init.d/foundationdb.distrib /etc/init.d/foundationdb
+fi
+sudo tee /etc/init.d/foundationdb >/dev/null <<'EOF'
+#!/bin/sh
+### BEGIN INIT INFO
+# Provides: foundationdb
+# Required-Start:
+# Required-Stop:
+# Default-Start: 2 3 4 5
+# Default-Stop: 0 1 6
+# Short-Description: FoundationDB is supervised by Amp, not SysV
+### END INIT INFO
+exit 0
+EOF
+sudo chmod 0755 /etc/init.d/foundationdb
+
+if [[ "$(dpkg-query -W -f='${Status} ${Version}' foundationdb-server 2>/dev/null || true)" != 'install ok installed 7.4.6' ]]; then
+  package="$(mktemp --suffix=.deb)"
+  trap 'rm -f "$package"' EXIT
+  curl -fL \
+    https://github.com/apple/foundationdb/releases/download/7.4.6/foundationdb-server_7.4.6-1_amd64.deb \
+    -o "$package"
+  echo '78694510c1e99f36a51cc32c84bed45e214899771e42ad2b604b254665d5d9cf  '"$package" | sha256sum -c -
+  sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "$package"
+  rm -f "$package"
+fi
+sudo update-rc.d -f foundationdb remove
+sudo install -d -o foundationdb -g foundationdb -m 0700 \
+  /var/lib/foundationdb/data/4500 /var/log/foundationdb
 
 if ! command -v effect-solutions >/dev/null 2>&1; then
   bun add --global effect-solutions@0.5.3

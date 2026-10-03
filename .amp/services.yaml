@@ -1,0 +1,6 @@
+services:
+  foundationdb:
+    platforms: [linux]
+    command: sudo -n -u foundationdb python3 -u .amp/start-foundationdb.py
+    port: 4500
+    # No portal is declared for the database.
